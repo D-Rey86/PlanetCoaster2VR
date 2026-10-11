@@ -1,0 +1,389 @@
+diff --git a/CheekyUEVRTests.vcxproj b/CheekyUEVRTests.vcxproj
+index 772413c..a8996fc 100644
+--- a/CheekyUEVRTests.vcxproj
++++ b/CheekyUEVRTests.vcxproj
+@@ -87,6 +87,7 @@
+     <ClCompile Include="tests\late_attach_tests.cpp" />
+     <ClCompile Include="uevr\settings_io.cpp" />
+     <ClCompile Include="src\settings.cpp" />
++    <ClCompile Include="src\d3d12_ngx_dispatch.cpp" />
+     <ClCompile Include="src\foveation.cpp" />
+   </ItemGroup>
+   <ItemGroup>
+diff --git a/src/d3d12_ngx_dispatch.cpp b/src/d3d12_ngx_dispatch.cpp
+index 3f36281..1a33048 100644
+--- a/src/d3d12_ngx_dispatch.cpp
++++ b/src/d3d12_ngx_dispatch.cpp
+@@ -3,6 +3,7 @@
+ #include <Windows.h>
+ #include "afw_compatibility.hpp"
+ #include "afw_eye_identity.hpp"
++#include "settings.hpp"
+ #include <mutex>
+ 
+ namespace cheeky::foveated_dlss {
+@@ -62,7 +63,9 @@ struct AfwCoreScope {
+ }  // namespace
+ 
+ void enable_afw_compatibility() noexcept { afw_enabled.store(true, std::memory_order_release); }
+-void configure_d3d12_hook_path(bool lower) noexcept { lower_hook_enabled.store(lower, std::memory_order_release); }
++void configure_d3d12_hook_path(bool lower) noexcept {
++    lower_hook_enabled.store(lower && !requires_higher_dlss_hook(), std::memory_order_release);
++}
+ bool d3d12_lower_hook_enabled() noexcept { return lower_hook_enabled.load(std::memory_order_acquire); }
+ bool d3d12_hook_restart_required(bool requested_lower) noexcept {
+     return requested_lower != lower_hook_enabled.load(std::memory_order_acquire);
+diff --git a/src/eye_calibration.cpp b/src/eye_calibration.cpp
+index 164d3b8..de3e063 100644
+--- a/src/eye_calibration.cpp
++++ b/src/eye_calibration.cpp
+@@ -694,7 +694,12 @@ void poll(State& s) {
+             (!f.search[0]->ready.load(std::memory_order_acquire) || !f.search[1]->ready.load(std::memory_order_acquire))) continue;
+         bool gpu12_reusable{};
+         const unsigned source_mask = (f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
+-        const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
++        // A native DX12 recording may be replayed for both submitted eyes with
++        // one DLSS source identity. This only relaxes source cardinality: both
++        // successful submissions and their independent marker proofs remain
++        // mandatory below, just as in the mixed-API shared-source path.
++        const bool mono = (f.pipelined || f.collect_source_pair) && f.evaluations == 1 &&
++            (source_mask == 1 || source_mask == 2);
+         f.shared_source_assumed=mono;
+         if (!f.verification_staged) {
+             if (f.external_used) {
+@@ -715,7 +720,7 @@ void poll(State& s) {
+                 s.stats.gpu_timing_status = "Unavailable across Vulkan source and D3D11 submission";
+             } else if (f.gpu12_used) {
+                 const bool mixed = f.pipelined;
+-                const auto result = calibration12_poll(*f.gpu12, mixed, mixed ? source_mask : 3U);
++                const auto result = calibration12_poll(*f.gpu12, mixed, source_mask);
+                 if (f.sequence >= s.measurement_start)
+                     s.stats.allocations += result.allocations;
+                 if (!result.ready)
+@@ -734,7 +739,7 @@ void poll(State& s) {
+                     s.stats.d3d12_readback_error = result.failure.result;
+                 }
+                 for (unsigned i = 0; i < (mixed ? 4U : 4U + f.placement_count * 8); ++i) {
+-                    if (mixed && !(source_mask & (1U << (i / 2)))) continue;
++                    if (i < 4 && !(source_mask & (1U << (i / 2)))) continue;
+                     f.patches[i].used = f.patches[i].ready = true;
+                     f.patches[i].score = result.scores[i];
+                     f.tracked[i] = result.tracked[i];
+@@ -1835,7 +1840,11 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
+     if (s.current < 0 || s.ring[s.current].epoch != s.epoch || retaining_calibration(s)) return 0;
+     auto& f = s.ring[s.current];
+     s.stats.submission_graphics_api = 12;
+-    if (f.collect_source_pair && f.evaluations < 2) {
++    // Preserve the existing wait for alternating sources. Only consider a
++    // single identity after two frame boundaries; readbacks will subsequently
++    // prove that same identity in BOTH submitted eyes before publishing it.
++    if (f.collect_source_pair && f.evaluations < 2 &&
++        !(f.evaluations == 1 && s.sequence - f.sequence >= 2)) {
+         ++s.waiting_for_sources;
+         return 0;
+     }
+diff --git a/src/eye_calibration_d3d12.cpp b/src/eye_calibration_d3d12.cpp
+index 7e93ff6..55efcd6 100644
+--- a/src/eye_calibration_d3d12.cpp
++++ b/src/eye_calibration_d3d12.cpp
+@@ -742,7 +742,9 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
+     if (!source_only && (!f.capture_counts[0] || !f.capture_counts[1]) && !strcmp(out.failure.stage, "none"))
+         out.failure = {"readback_patch_not_recorded"};
+     for (unsigned i = 0; i < (source_only ? 4U : unsigned(f.patches.size())); ++i) {
+-        if (source_only && !(source_mask & (1U << (i / 2)))) continue;
++        // Missing source B is permitted for a shared recorded source. Native
++        // submission readbacks are still required for both eyes below.
++        if (i < 4 && !(source_mask & (1U << (i / 2)))) continue;
+         if (i >= 4 && (i - 4) / 8 >= f.capture_counts[((i - 4) % 4) / 2] / 4) continue;
+         auto& p = f.patches[i];
+         if (!p.used) {
+diff --git a/src/settings.cpp b/src/settings.cpp
+index 8ee0b7d..1546a03 100644
+--- a/src/settings.cpp
++++ b/src/settings.cpp
+@@ -7,8 +7,20 @@
+ #include <deque>
+ #include <mutex>
+ #include <Windows.h>
++#include <cwchar>
+ 
+ namespace cheeky::foveated_dlss {
++
++bool requires_higher_dlss_hook() noexcept {
++    static const bool required = []() noexcept {
++        wchar_t path[32768]{};
++        const auto length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
++        if (!length || length >= std::size(path)) return false;
++        const auto separator = std::wcsrchr(path, L'\\');
++        return _wcsicmp(separator ? separator + 1 : path, L"PlanetCoaster2.exe") == 0;
++    }();
++    return required;
++}
+ namespace {
+ 
+ std::mutex settings_mutex;
+@@ -242,7 +254,8 @@ Settings current_settings() noexcept {
+ 
+ void update_settings(const Settings& settings) noexcept {
+     std::lock_guard lock(settings_mutex);
+-    d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
++    d3d12_lower_hook.store(settings.d3d12_lower_hook && !requires_higher_dlss_hook(),
++        std::memory_order_release);
+     enabled.store(settings.enabled, std::memory_order_release);
+     d3d11_use_d3d12_transport.store(
+         settings.d3d11_use_d3d12_transport,
+diff --git a/src/settings.hpp b/src/settings.hpp
+index a94e486..641a371 100644
+--- a/src/settings.hpp
++++ b/src/settings.hpp
+@@ -9,6 +9,9 @@
+ 
+ namespace cheeky::foveated_dlss {
+ 
++// Process identity is resolved once; this PC2 requirement is independent of GPU/headset.
++[[nodiscard]] bool requires_higher_dlss_hook() noexcept;
++
+ // Up to four requested regions (two eyes, fresh and filtered gaze). Bounds
+ // are normalized to the complete eye image, independently of the allocation.
+ struct FoveationMask {
+@@ -39,7 +42,7 @@ inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
+ 
+ struct Settings {
+     bool enabled{true};
+-    bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
++    bool d3d12_lower_hook{!requires_higher_dlss_hook()}; // Applied at interception startup.
+     bool d3d11_use_d3d12_transport{false};
+     bool peripheral_dlaa_enabled{true};
+     float peripheral_dlaa_scale{0.75F};
+diff --git a/standalone/overlay_ui.cpp b/standalone/overlay_ui.cpp
+index ef78b50..6390b6d 100644
+--- a/standalone/overlay_ui.cpp
++++ b/standalone/overlay_ui.cpp
+@@ -785,9 +785,13 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
+                     ImGui::SeparatorText("Compatibility");
+                     ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
+                     ImGui::TextWrapped("Required for DLSS-NR in DX11 games.");
+-                    ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
+-                    test_control("D3D12LowerHook");
+-                    ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
++                    if (requires_higher_dlss_hook()) {
++                        ImGui::TextWrapped("Higher DLSS hook (fixed for Planet Coaster 2)");
++                    } else {
++                        ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
++                        test_control("D3D12LowerHook");
++                        ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
++                    }
+                 }
+                 ImGui::SeparatorText("Status");
+                 ImGui::Text("Host: %s", runtime.host_name ? runtime.host_name : "Standalone");
+diff --git a/tests/gaze_tests.cpp b/tests/gaze_tests.cpp
+index fa5afd4..4ebc706 100644
+--- a/tests/gaze_tests.cpp
++++ b/tests/gaze_tests.cpp
+@@ -2763,6 +2763,9 @@ int run_vulkan_tests(bool real=false, bool integration=false);
+ int run_d3d11_binding_tests();
+ int run_debug_exposure_tests();
+ int main(int argc, char** argv) {
++    extern int run_native_shared_calibration_tests();
++    if (argc == 2 && std::strcmp(argv[1], "--native-shared-calibration") == 0)
++        return run_native_shared_calibration_tests();
+     if (argc == 2 && (std::strcmp(argv[1], "--openxr-independent-on") == 0 ||
+         std::strcmp(argv[1], "--openxr-independent-off") == 0)) {
+         extern int run_openxr_independent_option_tests(bool);
+diff --git a/tests/openxr_calibration_tests.cpp b/tests/openxr_calibration_tests.cpp
+index b5f1b63..5295779 100644
+--- a/tests/openxr_calibration_tests.cpp
++++ b/tests/openxr_calibration_tests.cpp
+@@ -1685,7 +1685,8 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
+ }
+ // Real GPU stamps/readbacks: after acquisition, change-only mode must leave
+ // freshly rendered source pixels untouched on every supported submission route.
+-void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend backend) {
++void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend backend,
++                          bool shared_native = false, bool missing_right_marker = false) {
+     roles();
+     auto settings = configured_settings();
+     settings.eye_calibration_continuous = false;
+@@ -1747,7 +1748,8 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
+                 gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                 gpu.list->CopyTextureRegion(&texture, 0, 0, 0, &linear, nullptr);
+                 gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+-                eye_calibration_stamp12(gpu.list.Get(), textures12[c].Get(), views[c], 0, 0, source_width, size);
++                if (!shared_native || c == 0)
++                    eye_calibration_stamp12(gpu.list.Get(), textures12[c].Get(), views[c], 0, 0, source_width, size);
+                 gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                 linear.pResource = readback.Get();
+                 gpu.list->CopyTextureRegion(&linear, 0, 0, 0, &texture, nullptr);
+@@ -1773,7 +1775,7 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
+             }
+         }
+         for (unsigned eye = 0; eye < 2; ++eye) {
+-            const auto c = swapped ? 1 - eye : eye;
++            const auto c = shared_native ? (missing_right_marker && eye == 1 ? 1U : 0U) : swapped ? 1 - eye : eye;
+             const auto ticket = submit11 ? eye_calibration_submit(textures11[c].Get(), eye, 0, 0, right_bound, 1, 0, backend, session) :
+                 eye_calibration_submit12(textures12[c].Get(), gpu.queue.Get(), eye, 0, 0, right_bound, 1, 0, backend, session);
+             if (expect_clean) require(ticket == 0, "Retained calibration must not enqueue readbacks");
+@@ -1799,7 +1801,27 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
+         require(eye_calibration_stats().crop_mapping_active, "Change-only calibration must acquire and publish a crop");
+         for (unsigned i = 0; i < 12; ++i) frame(true);
+     };
++    if (missing_right_marker) {
++        for (unsigned i = 0; i < 100; ++i) frame();
++        require(!eye_calibration_stats().crop_mapping_active && !stereo_eye_assignment(views[0]).calibrated,
++            "Native DX12 shared source must reject a marker present in only one submitted eye");
++        cleanup();
++        std::cout << "PASS native DX12 shared-source missing-eye rejection\n";
++        return;
++    }
+     acquire();
++    if (shared_native) {
++        require(stereo_eye_assignment(views[0]).shared_source && !stereo_eye_assignment(views[1]).calibrated,
++            "Native DX12 must publish only the source independently proved in both submitted eyes");
++        const auto retained = eye_calibration_stats();
++        for (unsigned i = 0; i < 25; ++i) frame(true);
++        require(eye_calibration_stats().captures == retained.captures &&
++            eye_calibration_stats().allocations == retained.allocations,
++            "Native DX12 shared-source retention must stop marker/readback allocations");
++        cleanup();
++        std::cout << "PASS native DX12 shared-source acquisition and clean retention\n";
++        return;
++    }
+     const auto stable = eye_calibration_stats();
+     require(stable.acquisition_confirmations == 1,
+         "Change-only mode must retain the first valid publication without continuing marker verification");
+@@ -1965,6 +1987,15 @@ int run_retained_calibration_tests() {
+         unregister_stereo_view(9103); return 1;
+     }
+ }
++int run_native_shared_calibration_tests() {
++    try {
++        retained_calibration(true, false, EyeCalibrationBackend::openxr, true);
++        retained_calibration(true, false, EyeCalibrationBackend::openxr, true, true);
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << "Native shared calibration: " << e.what() << '\n'; cleanup(); return 1;
++    }
++}
+ int run_libovr_transfer_tests() {
+     try {
+         retained_calibration(false, true, EyeCalibrationBackend::libovr);
+diff --git a/tests/overlay_tests.cpp b/tests/overlay_tests.cpp
+index eb226d6..7b5a4ae 100644
+--- a/tests/overlay_tests.cpp
++++ b/tests/overlay_tests.cpp
+@@ -174,7 +174,10 @@ void test_ui_diagnostics() {
+     require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
+     render("General"); text = render("General");
+     require(text.find("Change menu key") != text.npos && text.find("DX11 -> DX12 transport") != text.npos &&
+-        text.find("Use lower DLSS hook (DX12)") != text.npos && text.find("Runtime ready") != text.npos &&
++        (requires_higher_dlss_hook()
++            ? text.find("Higher DLSS hook (fixed for Planet Coaster 2)") != text.npos &&
++                text.find("Use lower DLSS hook (DX12)") == text.npos && !control_positions.contains("D3D12LowerHook")
++            : text.find("Use lower DLSS hook (DX12)") != text.npos) && text.find("Runtime ready") != text.npos &&
+         text.find("DLSS hook change saved") != text.npos, "General controls and statuses missing");
+     const auto general_snapshot = state.snapshot;
+     for (const auto* status : {"Waiting for DLSS", "Not detected (game DLL)",
+diff --git a/tests/uevr_tests.cpp b/tests/uevr_tests.cpp
+index 621a5f3..ea54746 100644
+--- a/tests/uevr_tests.cpp
++++ b/tests/uevr_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime_api.hpp"
+ #include "settings_io.hpp"
+ #include "processing_owner.hpp"
++#include "d3d12_ngx_dispatch.hpp"
+ #include "late_attach_tests.hpp"
+ #include "runtime_search.hpp"
+ #include "frame_cadence.hpp"
+@@ -24,6 +25,54 @@
+ 
+ using namespace cheeky::foveated_dlss;
+ using Microsoft::WRL::ComPtr;
++
++// CPU-only: exercise real process detection, config migration, reset and hook enforcement.
++int run_pc2_settings_policy_tests(bool expect_pc2) {
++    try {
++        const auto check_policy = [](bool value, const char* why) {
++            if (!value) throw std::runtime_error(why);
++        };
++        check_policy(requires_higher_dlss_hook() == expect_pc2, "Process compatibility scope mismatch");
++        Settings s;
++        check_policy(s.d3d12_lower_hook == !expect_pc2, "Incorrect process-scoped default");
++        s.width = .73F; s.height = .62F; s.center_preset = 13;
++        s.nr_width = .37F; s.gaze_smoothing_ms = 47;
++        check_policy(set_named_setting(s, "D3D12LowerHook", "true") &&
++            s.d3d12_lower_hook == !expect_pc2, "Named hook setting bypassed compatibility");
++        check_policy(!set_named_setting(s, "D3D12LowerHook", "invalid") &&
++            s.d3d12_lower_hook == !expect_pc2, "Malformed hook value changed settings");
++        s.d3d12_lower_hook = true;
++        update_settings(s);
++        check_policy(configured_settings().d3d12_lower_hook == !expect_pc2 &&
++            configured_settings().width == .73F && configured_settings().center_preset == 13,
++            "Runtime guard changed unrelated settings or allowed the lower hook");
++        configure_d3d12_hook_path(true);
++        check_policy(d3d12_lower_hook_enabled() == !expect_pc2, "Startup hook bypassed compatibility");
++        check_policy(reset_settings_group(s, "sr") && s.width == .55F && s.height == .45F &&
++            s.d3d12_lower_hook == !expect_pc2 && s.nr_width == .37F && s.gaze_smoothing_ms == 47,
++            "SR reset lost compatibility or changed another settings group");
++        const auto path = std::filesystem::temp_directory_path() /
++            (L"cheeky-pc2-policy-" + std::to_wstring(GetCurrentProcessId()) + L".ini");
++        std::string error;
++        { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nD3D12LowerHook=1\nWidth=0.73\nHeight=0.62\nCenterPreset=13\n"; }
++        check_policy(read_settings_file(path, s, error) && s.d3d12_lower_hook == !expect_pc2 &&
++            s.width == .73F && s.height == .62F && s.center_preset == 13,
++            "Legacy true-hook config rejected or changed unrelated fields");
++        check_policy(write_settings_file(path, s, error), "Cannot save repaired settings");
++        Settings saved;
++        check_policy(read_settings_file(path, saved, error) && saved.d3d12_lower_hook == !expect_pc2 &&
++            saved.width == .73F && saved.center_preset == 13, "Repair did not survive restart/roundtrip");
++        { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nWidth=0.61\n"; }
++        check_policy(read_settings_file(path, s, error) && s.d3d12_lower_hook == !expect_pc2 && s.width == .61F,
++            "Missing-hook legacy config bypassed compatibility");
++        std::filesystem::remove(path);
++        std::printf("PASS CPU settings/reset/startup policy (%s)\n", expect_pc2 ? "Planet Coaster 2" : "other process");
++        return 0;
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "PC2 compatibility test failed: %s\n", error.what());
++        return 1;
++    }
++}
+ namespace {
+ void require(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+ void check(HRESULT hr, const char* why) { require(SUCCEEDED(hr), why); }
+@@ -189,6 +238,9 @@ void settings_tests(const std::filesystem::path& root) {
+ }
+ }
+ int main(int argc, char** argv) {
++    if (argc == 3 && std::strcmp(argv[1], "--pc2-settings-policy") == 0 &&
++        (std::strcmp(argv[2], "pc2") == 0 || std::strcmp(argv[2], "generic") == 0))
++        return run_pc2_settings_policy_tests(std::strcmp(argv[2], "pc2") == 0);
+     try {
+         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+         const auto bin = std::filesystem::path(exe).parent_path();
+diff --git a/uevr/settings_io.cpp b/uevr/settings_io.cpp
+index 3c0e2a3..f4fbe29 100644
+--- a/uevr/settings_io.cpp
++++ b/uevr/settings_io.cpp
+@@ -39,6 +39,13 @@ std::string_view trim(std::string_view s) {
+ }
+ }
+ bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
++    if (key == "D3D12LowerHook") {
++        bool requested{};
++        if (!parse(value, requested)) return false;
++        // Repair legacy/edited configs without rejecting their other valid settings.
++        s.d3d12_lower_hook = requested && !requires_higher_dlss_hook();
++        return true;
++    }
+ #define CHEEKY_SETTING(name, field) if (key == name) return parse(value, s.field);
+ #include "settings_fields.inc"
+ #undef CHEEKY_SETTING
+@@ -98,7 +105,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
+     std::ifstream in(path);
+     if (!in) { error = "Cannot read settings file"; return false; }
+     auto candidate = s;
+-    candidate.d3d12_lower_hook = true; // Older files use the new lower-hook default.
++    candidate.d3d12_lower_hook = Settings{}.d3d12_lower_hook;
+     candidate.manual_stereo_mapping = false;
+     candidate.manual_stereo_right_first = false;
+     candidate.independent_openxr_gaze = false;

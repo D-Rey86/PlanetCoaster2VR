@@ -1,0 +1,9 @@
+{
+  "loaderRelease": "1.1.63",
+  "loaderSha256": "66946EA6E9CC2649E299EC412521C5EAFE56C635D05055097FE4DB81E11932DF",
+  "headersApiVersion": "1.1.62",
+  "sourceRepository": "https://github.com/KhronosGroup/OpenXR-SDK-Source",
+  "sourceCommit": "2b99fec95e9cdf352c1a98e9cb23bf4def1cf8e6",
+  "sourceArchiveUrl": "https://codeload.github.com/KhronosGroup/OpenXR-SDK-Source/zip/2b99fec95e9cdf352c1a98e9cb23bf4def1cf8e6",
+  "sourceArchiveSha256": "8FF183EE141115989A5FD58B24FD427124A286EAC2CC475510F8303B5E69B787"
+}

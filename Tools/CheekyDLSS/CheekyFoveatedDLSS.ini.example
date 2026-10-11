@@ -1,0 +1,11 @@
+[CheekyFoveatedDLSS]
+SchemaVersion=1
+Enabled=0
+D3D12LowerHook=0
+PeripheralDlaa=0
+Width=0.55
+Height=0.45
+AutoStereoAlignment=1
+EyeCalibrationContinuous=0
+AlignmentBorder=0
+NrEnabled=0

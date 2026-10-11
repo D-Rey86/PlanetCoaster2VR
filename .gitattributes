@@ -1,0 +1,5 @@
+# Unified-diff context lines and verbatim upstream licenses are data, not code.
+# Preserve patch line endings and do not strip mandatory context prefixes.
+Tools/CheekyDLSS/*.patch text eol=lf -whitespace
+Tools/CheekyDLSS/LICENSE.upstream.txt text eol=lf -whitespace
+LICENSE text eol=lf -whitespace

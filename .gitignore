@@ -1,0 +1,89 @@
+# Visual Studio / MSBuild / CMake build output
+.vs/
+.vscode/
+.idea/
+Builds/
+Releases/
+build/
+out/
+**/bin/
+**/obj/
+x64/
+Debug/
+Release/
+CMakeFiles/
+CMakeCache.txt
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.ipch
+
+# Native binaries and debug artifacts
+*.dll
+*.exe
+!ThirdParty/**/openxr_loader.dll
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.obj
+*.o
+*.tlog
+*.idb
+
+# Game files and dumps - DO NOT COMMIT.
+# Planet Coaster 2 is Frontier's copyrighted code and data; anything extracted
+# from the user's own copy (executables, dumps, decompilation, IDA/Ghidra
+# databases) is regenerable by anyone who owns the game.
+GameFiles/
+GameReferences/
+Dumps/
+*.dmp
+*.mdmp
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.gpr
+*.rep/
+
+# Graphics captures and profiling
+*.rdc
+*.nsight-gfxproj
+*.ngfx-capture
+*.etl
+
+# Fetched third-party tools
+Tools/Downloads/
+
+# Runtime logs
+*.log
+
+# Machine-local settings (game path etc). Commit a .example template instead.
+Directory.Build.props
+local.props
+*.local.ini
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code machine-local settings
+.claude/settings.local.json
+
+# Third-party package used by Tools/test (install with pip instead)
+Tools/test/vgamepad-*/
+__pycache__/
+
+Notes/headset_ini_backup.ini
+
+# Local discovery output and virtual-controller command queue
+surv.json
+Tools/test/padcmd.txt

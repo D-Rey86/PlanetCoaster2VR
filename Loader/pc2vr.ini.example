@@ -1,0 +1,33 @@
+[Loader]
+; 0 = load only, 1 = late hooks, 2 = early + late hooks (needed for VR)
+HookStage=2
+HookDelayMs=3000
+; 1 = start OpenXR (headset), 0 = hooks only
+XR=1
+; 1 renders a separate game view for each eye; required for the stereo VR mod.
+Stereo=1
+; 0 selects the mode's default ceiling:130deg original,155deg expanded coverage.
+; A positive value explicitly overrides either mode; near180deg is unsupported.
+EngineFovMaxDeg=0
+[Resolution]
+; Percent of headset-recommended pixel density (25-200); menu edits apply live.
+ScalePercent=100
+; Optional wider/canted/roll coverage. Off restores original FOV policy for performance.
+; The VR menu saves this0/1 toggle and applies it during play.
+ExpandedCoverage=0
+[Rendering]
+; GPU variable-rate shading is enabled by default where supported. Applies live.
+; Separate from Cheeky DLSS; set 0 to disable.
+Foveated=1
+FoveatedInnerDeg=25
+FoveatedMiddleDeg=40
+[UI]
+; Adds a controller-driven VR tab to the game's existing Settings menu.
+VRMenu=1
+Panel=1
+PanelWidthDeg=55
+PanelDistanceCm=150
+PanelHeightDeg=-5
+PanelHorizontalDeg=0
+; 0 = recentered placement, 1 = HUD and selection circle follow the HMD.
+FollowHmd=0

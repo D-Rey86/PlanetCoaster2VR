@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6B1C3E52-8D2F-4C77-9A0E-3F5D2C1A7B40}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>PC2VRLoader</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)..\Builds\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+    <TargetName>version</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>NDEBUG;WIN32;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\ThirdParty\OpenXR\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <ModuleDefinitionFile>$(ProjectDir)src\version.def</ModuleDefinitionFile>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3d12.lib;d3dcompiler.lib;xmllite.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\vr_menu.cpp" />
+    <ClCompile Include="src\version_proxy.cpp" />
+    <ClCompile Include="src\log.cpp" />
+    <ClCompile Include="src\d3d12_hooks.cpp" />
+    <ClCompile Include="src\upload_registry.cpp" />
+    <ClCompile Include="src\upload_read.cpp" />
+    <ClCompile Include="src\cb_math.cpp" />
+    <ClCompile Include="src\cb_patcher.cpp" />
+    <ClCompile Include="src\xr_runtime.cpp" />
+    <ClCompile Include="src\camera_control.cpp" />
+    <ClCompile Include="src\input_hook.cpp" />
+    <ClCompile Include="src\inline_hook.cpp" />
+    <ClCompile Include="src\stereo.cpp" />
+    <ClCompile Include="src\config_redirect.cpp" />
+    <ClCompile Include="src\control_settings.cpp" />
+    <ClCompile Include="src\depth_probe.cpp" />
+    <ClCompile Include="src\vrs.cpp" />
+    <ClCompile Include="src\rtv_registry.cpp" />
+    <ClCompile Include="src\highlight_mask.cpp" />
+    <ClCompile Include="src\ui_layer.cpp" />
+    <ClCompile Include="src\ride_camera.cpp" />
+    <ClCompile Include="src\game_props.cpp" />
+    <ClCompile Include="src\game_state.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\log.h" />
+    <ClInclude Include="src\control_settings.h" />
+    <ClInclude Include="src\depth_probe.h" />
+    <ClInclude Include="src\vrs.h" />
+    <ClInclude Include="src\rtv_registry.h" />
+    <ClInclude Include="src\highlight_mask.h" />
+    <ClInclude Include="src\highlight_signature.h" />
+    <ClInclude Include="src\ui_layer.h" />
+    <ClInclude Include="src\panel_geometry.h" />
+    <ClInclude Include="src\frustum_bounds.h" />
+    <ClInclude Include="src\vr_menu.h" />
+    <ClInclude Include="src\vr_menu_values.h" />
+    <ClInclude Include="src\ride_camera.h" />
+    <ClInclude Include="src\game_props.h" />
+    <ClInclude Include="src\game_state.h" />
+    <ClInclude Include="src\d3d12_hooks.h" />
+    <ClInclude Include="src\upload_registry.h" />
+    <ClInclude Include="src\upload_table.h" />
+    <ClInclude Include="src\upload_read.h" />
+    <ClInclude Include="src\view_cb.h" />
+    <ClInclude Include="src\cb_math.h" />
+    <ClInclude Include="src\cb_patcher.h" />
+    <ClInclude Include="src\xr_runtime.h" />
+    <ClInclude Include="src\camera_control.h" />
+    <ClInclude Include="src\input_hook.h" />
+    <ClInclude Include="src\inline_hook.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\version.def" />
+  </ItemGroup>
+  <Target Name="CopyOpenXrLoader" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)..\ThirdParty\OpenXR\openxr_loader.dll" DestinationFolder="$(OutDir)PC2VR\" />
+    <Copy SourceFiles="$(ProjectDir)ui\VRMenu.js" DestinationFolder="$(OutDir)PC2VR\" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
