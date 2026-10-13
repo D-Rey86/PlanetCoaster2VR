@@ -20,23 +20,22 @@ constexpr int32_t kMaxLocks = 64;  // a plausible lock count; anything else is n
 constexpr uint32_t kTable = 0x45;  // a record holding a table
 constexpr int kMaxNodeBits = 8;    // ride settings: 16 fields (2^4) measured
 
-const char* const kNames[] = {"nDisableChangeCameraModeCount", "tSelection", "sMode", "sSelectedInterestCam"};
-enum { kCountName, kSelectionName, kModeName, kInterestName, kNameCount };
+const char* const kNames[] = {"nDisableChangeCameraModeCount", "tSelection"};
+enum { kCountName, kSelectionName, kNameCount };
 
 struct Found {
     const uint8_t* value;
     uintptr_t key;
+    uintptr_t modeKey = 0, interestKey = 0;  // keys belonging to this selection table
 };
 
 std::atomic<bool> g_scanBusy{false}, g_scanDone{false};
 std::mutex g_scanMutex;
 std::vector<Found> g_scanCounts, g_scanSelections;  // guarded by g_scanMutex
-uintptr_t g_scanModeKey = 0, g_scanInterestKey = 0;  // guarded by g_scanMutex
 
 // Render thread only.
 std::vector<Found> g_counts;  // the camera-mode record and any stale copy of it
 Found g_selection{};
-uintptr_t g_modeKey = 0, g_interestKey = 0;
 int32_t g_locks = 0;
 bool g_inPark = false;
 Ride g_ride = Ride::None;
@@ -83,6 +82,37 @@ Ride ModeInSelection(const void* selectionValue, uintptr_t modeKey, uintptr_t in
     return interest ? mode : Ride::None;
 }
 
+// Park changes can leave multiple string objects with identical names (measured
+// 2026-10-12). Their heap-wide uniqueness says nothing about which camera is active.
+// Resolve the keys from the selection's own fields on the scan thread, then retain
+// the existing cheap identity checks on the render thread.
+bool ResolveSelection(Found& found) {
+    uintptr_t table, nodes;
+    uint8_t header[0x20];
+    if (!props::SafeRead(found.value, &table, sizeof(table)) || table < 0x10000 ||
+        !props::SafeRead(reinterpret_cast<const void*>(table), header, sizeof(header)))
+        return false;
+    const int bits = header[0xB];
+    memcpy(&nodes, header + 0x18, sizeof(nodes));
+    if (bits > kMaxNodeBits || nodes < 0x10000) return false;
+    found.modeKey = found.interestKey = 0;
+    for (int i = 0; i < (1 << bits); ++i) {
+        uint8_t rec[0x20];
+        if (!props::SafeRead(reinterpret_cast<const uint8_t*>(nodes) + i * 0x30, rec, sizeof(rec))) return false;
+        uint32_t kind;
+        uintptr_t key;
+        memcpy(&kind, rec + 0x10, sizeof(kind));
+        memcpy(&key, rec + 0x18, sizeof(key));
+        if (kind != props::kString) continue;
+        char name[32];
+        if (!props::StringValue(&key, name, sizeof(name))) continue;
+        if (strcmp(name, "sMode") == 0) found.modeKey = key;
+        else if (strcmp(name, "sSelectedInterestCam") == 0) found.interestKey = key;
+    }
+    return found.modeKey && found.interestKey &&
+           ModeInSelection(found.value, found.modeKey, found.interestKey) != Ride::None;
+}
+
 struct ScanCtx {
     std::vector<uintptr_t> keys[kNameCount];
     std::vector<Found> counts, selections;
@@ -124,13 +154,11 @@ DWORD WINAPI ScanThread(LPVOID) {
     props::FindNames(kNames, kNameCount, c.keys);
     if (!c.keys[kCountName].empty() || !c.keys[kSelectionName].empty()) props::ForEachHeapRegion(ScanRegion, &c);
     // Only the selections holding the ride camera settings.
-    const uintptr_t modeKey = c.keys[kModeName].size() == 1 ? c.keys[kModeName][0] : 0;
-    const uintptr_t interestKey = c.keys[kInterestName].size() == 1 ? c.keys[kInterestName][0] : 0;
     std::vector<Found> rides;
     std::vector<uintptr_t> tables;  // two fields holding the same table count once
-    for (const Found& f : c.selections) {
+    for (Found f : c.selections) {
         uintptr_t table;
-        if (!modeKey || !interestKey || ModeInSelection(f.value, modeKey, interestKey) == Ride::None || !props::SafeRead(f.value, &table, 8) ||
+        if (!ResolveSelection(f) || !props::SafeRead(f.value, &table, 8) ||
             Has(tables, table))
             continue;
         tables.push_back(table);
@@ -143,8 +171,6 @@ DWORD WINAPI ScanThread(LPVOID) {
         std::lock_guard<std::mutex> lock(g_scanMutex);
         g_scanCounts = std::move(c.counts);
         g_scanSelections = std::move(rides);
-        g_scanModeKey = modeKey;
-        g_scanInterestKey = interestKey;
     }
     g_scanDone.store(true);
     g_scanBusy.store(false);
@@ -174,19 +200,14 @@ const char* RideName(Ride r) {
 void Update(const float cameraPos[3]) {
     if (g_scanDone.exchange(false)) {
         std::vector<Found> counts, selections;
-        uintptr_t modeKey, interestKey;
         {
             std::lock_guard<std::mutex> lock(g_scanMutex);
             counts.swap(g_scanCounts);
             selections.swap(g_scanSelections);
-            modeKey = g_scanModeKey;
-            interestKey = g_scanInterestKey;
         }
         g_counts = std::move(counts);
         if (selections.size() == 1 && !g_selection.value) {
             g_selection = selections[0];
-            g_modeKey = modeKey;
-            g_interestKey = interestKey;
         }
         if ((g_counts.size() > 1 || selections.size() > 1) && ++g_ambiguousLogs <= 10)
             LOG("gamestate: %zu camera-mode record(s) and %zu ride camera selection(s)", g_counts.size(), selections.size());
@@ -218,7 +239,7 @@ void Update(const float cameraPos[3]) {
     Ride ride = Ride::None;
     if (g_locks > 0 && g_selection.value) {
         if (props::RecordIs(g_selection.value, g_selection.key, kTable))
-            ride = ModeInSelection(g_selection.value, g_modeKey, g_interestKey);
+            ride = ModeInSelection(g_selection.value, g_selection.modeKey, g_selection.interestKey);
         if (ride == Ride::None) g_selection = {};
     }
     if (ride != g_ride) LOG("gamestate: ride camera %s", RideName(ride));

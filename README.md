@@ -4,6 +4,13 @@ A Windows PC VR mod for Planet Coaster 2, with stereo rendering, headset-driven
 park and supported ride cameras, controller input, and the game's HUD in VR.
 This is an **alpha** release; compatibility and performance feedback are welcome.
 
+Alpha 2 fixes Guest rider views remaining on the fixed screen after switching
+parks. Camera detection now resolves settings within the ride camera's own table,
+so duplicate setting names left in memory no longer prevent head tracking.
+Maintainer testing passed across many rides, including DLC rides. Simulator
+checks also covered empty closed/testing rides, park transitions and camera-mode
+switching. This does not establish exhaustive coverage of every ride or device.
+
 CheekyFoveatedDLSS is integrated into the VR menu and bundled in the
 alpha. Its foveated DLSS processing is optional at runtime and requires NVIDIA
 DLSS support. The core VR mod can run with the game's DLSS setting off.

@@ -22,7 +22,7 @@ $publicFiles=@($files | Where-Object {
     $_ -match '^ThirdParty/OpenXR/(LICENSE\.txt|README\.md|SOURCE\.json|openxr_loader\.dll|include/openxr/[^/]+\.(h|txt))$' -or
     $_ -in @('Tools/package-alpha.ps1','Tools/sanitize-pdb-paths.ps1','Tools/deploy.ps1','Tools/gamedir.ps1') -or
     $_ -match '^Tools/CheekyDLSS/(README\.md|LICENSE\.upstream\.txt|pc2-cheeky-compatibility\.patch|CheekyFoveatedDLSS\.ini\.example|build\.ps1|package\.ps1|launch\.ps1)$' -or
-    $_ -match '^Tools/test/(control_settings_test|upload_read_test|upload_registry_test|frustum_bounds_test|coverage_policy_test|vr_menu_test|vrs_capability_test)\.(cpp|vcxproj)$' -or
+    $_ -match '^Tools/test/(control_settings_test|upload_read_test|upload_registry_test|frustum_bounds_test|coverage_policy_test|vr_menu_test|vrs_capability_test|game_state_test)\.(cpp|vcxproj)$' -or
     $_ -in @('Tools/test/vr_menu_frontend_test.cjs','Tools/test/launcher_test.ps1')
 })
 foreach($required in @('LICENSE','README.md','THIRD_PARTY.md','RELEASE_PREP.md',
