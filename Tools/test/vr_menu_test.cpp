@@ -15,8 +15,10 @@ void ApplySettings(const PanelSettings& settings) {testPanel=settings;}
 namespace pc2vr::xr {
 int testPercent{};
 bool testCoverage{};
+StereoMode testStereoMode{};
 void RequestResolutionScale(int percent) {testPercent=percent;}
 void RequestExpandedCoverage(bool on) {testCoverage=on;}
+void RequestStereoMode(StereoMode mode) {testStereoMode=mode;}
 ResolutionInfo ResolutionStatus() {return {2096,2096};}
 void RequestRecenter() {}
 }
@@ -36,8 +38,8 @@ void* Allocate(void* object,uint64_t size) {auto& r=*static_cast<Response*>(obje
 void Complete(void* object,unsigned status) {auto& r=*static_cast<Response*>(object);r.final.assign(r.bytes.begin(),r.bytes.end());r.bytes.clear();r.status=status;++finished;}
 void Cache(void*,const void*) {++optimized;}
 void Partial(void*) {++progress;}
-void Register(Response& response) {
-    pc2vr::menu::g_pending[0]={&response,0,nullptr,false};pc2vr::menu::g_pendingCount=1;
+void Register(Response& response,bool pause=false) {
+    pc2vr::menu::g_pending[0]={&response,0,nullptr,false,pause};pc2vr::menu::g_pendingCount=1;
 }
 std::string lastCommand;
 bool acceptCommand=true;
@@ -47,7 +49,9 @@ bool Command(const char* command) {lastCommand=command;++commandCount;return acc
 }
 int wmain(int argc,wchar_t** argv) {
     using namespace pc2vr::menu;
-    Require(argc==3,"supply test-only ini path and privately extracted shipping settings module");g_ini=argv[1];
+    Require(argc>=4 && argc<=6,"supply test-only ini path, shipping settings/pause modules and optional HUD/rider modules");g_ini=argv[1];
+    Require(LoadEmbeddedScript() && g_script.find("export function installVRMenu")!=std::string::npos,
+        "VR menu must load from this module's embedded resource without a loose script");
     g_space=Allocate;g_finish=Complete;g_optimized=Cache;g_progress=Partial;
     std::ifstream source(argv[2],std::ios::binary);
     const std::string original((std::istreambuf_iterator<char>(source)),std::istreambuf_iterator<char>());
@@ -68,7 +72,64 @@ int wmain(int argc,wchar_t** argv) {
     Require(incremental.final==original && progress==1,"incremental response fails closed without partial-module patch");
     Response unknown;Register(unknown);bytes=static_cast<char*>(Space(&unknown,4));memcpy(bytes,"test",4);Finish(&unknown,0);
     Require(unknown.final=="test","changed module layout fails closed");
+    std::ifstream pauseFile(argv[3],std::ios::binary);
+    const std::string pauseSource((std::istreambuf_iterator<char>(pauseFile)),std::istreambuf_iterator<char>());
+    Require(pauseSource.size()>10000,"real shipping pause source missing");
+    Response pause;Register(pause,true);bytes=static_cast<char*>(Space(&pause,pauseSource.size()));memcpy(bytes,pauseSource.data(),pauseSource.size());
+    Finish(&pause,0);Require(pause.final==pauseSource+kPauseAppend,"pause lifecycle append changed original module");
+    auto context=PauseOwner();Require(!PauseVisible() && context.find("\"owner\":1")!=std::string::npos,"new owner failed to clear pause state");
+    Require(PauseState("owner=1&seq=1&visible=1")=="{\"ok\":true}" && PauseVisible(),"pause open not published");
+    PauseState("owner=1&seq=2&visible=0");PauseState("owner=1&seq=1&visible=1");Require(!PauseVisible(),"late open revived closed pause");
+    PauseOwner();PauseState("owner=2&seq=1&visible=1");PauseState("owner=1&seq=3&visible=0");Require(PauseVisible(),"old UI teardown closed the new pause owner");
+    for(const auto* invalid:{"owner=2&seq=2&visible=2","owner=2&seq=2&visible=0junk","owner=2&seq=2&seq=3&visible=0","seq=2&visible=0"})
+        Require(PauseState(invalid)=="{\"ok\":false}" && PauseVisible(),"invalid pause context modified input ownership");
+    PauseState("owner=2&seq=2&visible=0");Require(!PauseVisible(),"unmount failed to release pause ownership");
+    if(argc>5){
+        std::ifstream cameraFile(argv[5],std::ios::binary);
+        const std::string native((std::istreambuf_iterator<char>(cameraFile)),std::istreambuf_iterator<char>());
+        Require(native.size()>5000,"shipping rider source missing");g_cameraClicks.Start();
+        Response camera;Register(camera);g_pending[0].camera=true;
+        bytes=static_cast<char*>(Space(&camera,native.size()));memcpy(bytes,native.data(),native.size());Finish(&camera,0);
+        Require(camera.final==native+detail::kRideAppend+detail::kCameraAppend,"rider append preserves native camera controls byte-for-byte");
+        const auto selectionOwner=g_selectionPanel.NewOwner();CameraOwner();
+        Require(g_selectionPanel.Read().owner==selectionOwner,"rider menu owner cannot invalidate park selection ownership");
+        Require(!CameraWait(nullptr,"owner=0") && !CameraWait(nullptr,"owner=1junk"),"rider wait rejects malformed/hidden owners");
+        Require(!RideValidate("owner=1",true),"rider clicks fail closed without a fresh tracked input snapshot");
+        g_cameraClicks.Stop();
+    }
     const auto rejected=[](std::string_view query){return Apply(query).find("\"ok\":false")!=std::string::npos;};
+    using pc2vr::xr::StereoMode;
+    Require(StateJSON().find("\"StereoMode\":0")!=std::string::npos,"true stereo is the default");
+    Require(rejected("key=StereoMode&value=3"),"unknown rendering mode rejected");
+    Require(pc2vr::xr::ReadStereoMode(-1,1)==StereoMode::AER &&
+            pc2vr::xr::ReadStereoMode(0,1)==StereoMode::TrueStereo,"legacy AER and explicit mode precedence");
+    for (int mode : {1,2,0}) {
+        Require(Apply("key=StereoMode&value="+std::to_string(mode))=="{\"ok\":true}" &&
+            static_cast<int>(pc2vr::xr::testStereoMode)==mode &&
+            GetPrivateProfileIntW(L"Stereo",L"Mode",-1,g_ini.c_str())==static_cast<UINT>(mode),
+            "each rendering mode applies and persists");
+    }
+    Require(rejected("key=UIDashboard&value=2"),"dashboard is boolean");
+    const auto originalPanel=pc2vr::ui::testPanel;
+    Require(Apply("key=UIDashboard&value=0")=="{\"ok\":true}" && !pc2vr::ui::testPanel.dashboard,"dashboard toggle applies");
+    Require(pc2vr::ui::testPanel.buildWheel==originalPanel.buildWheel && pc2vr::ui::testPanel.ridePanel==originalPanel.ridePanel,"dashboard preserves other wrist features");
+    Require(Apply("key=UIDashboard&value=1")=="{\"ok\":true}" && GetPrivateProfileIntW(L"UI",L"WristDashboard",0,g_ini.c_str())==1,"dashboard toggle persists");
+    if(argc>4){
+        std::ifstream hudFile(argv[4],std::ios::binary);
+        const std::string hudSource((std::istreambuf_iterator<char>(hudFile)),std::istreambuf_iterator<char>());
+        Require(hudSource.size()>20000,"shipping HUD source missing");g_dashboardClicks.Start();
+        Response hud;Register(hud);g_pending[0].dashboard=true;
+        bytes=static_cast<char*>(Space(&hud,hudSource.size()));memcpy(bytes,hudSource.data(),hudSource.size());Finish(&hud,0);
+        Require(hud.final==hudSource+detail::kNotificationAppend+detail::kDashboardAppend,"HUD extension preserves exact native bytes and both complete extensions");
+        const auto savedPanel=pc2vr::ui::testPanel;
+        pc2vr::ui::testPanel.on=pc2vr::ui::testPanel.dashboard=true;
+        pc2vr::ui::testPanel.buildWheel=true;g_buildAvailable.store(true);
+        Require(DashboardEnabled(),"notification inbox has a reachable build-wheel owner");
+        pc2vr::ui::testPanel.buildWheel=false;
+        Require(!DashboardEnabled(),"disabling wheel restores native notifications instead of hiding the only inbox");
+        pc2vr::ui::testPanel=savedPanel;g_buildAvailable.store(false);
+        g_dashboardClicks.Stop();
+    }
     Require(rejected("key=Resolution&value=0"),"reject zero size");
     Require(rejected("key=Resolution&value=201"),"reject excessive size");
     Require(rejected("key=Resolution&value=100junk"),"reject malformed integer");

@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "cb_math.h"
+#include "stereo_mode.h"
 
 struct ID3D12CommandQueue;
 struct IDXGISwapChain;
@@ -10,6 +11,7 @@ struct ID3D12Resource;
 struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct D3D12_RESOURCE_BARRIER;
+namespace pc2vr::afw { struct Frame; }
 
 namespace pc2vr::xr {
 
@@ -60,6 +62,11 @@ bool EngineView();
 
 void RequestRecenter();
 bool IsRunning();
+// Startup opt-in until the native pointer path and controller runtime are verified.
+void SetMotionControllers(bool on);
+// Isolated world-only laser candidate; startup opt-in until headset acceptance.
+void SetWorldLaser(bool on);
+void SetMenuLaser(bool on);
 
 // ---- true stereo (see stereo.cpp) ----
 // worldScale multiplies the runtime's eye separation in the game world.
@@ -74,6 +81,13 @@ bool EyeCentersTan(float out[2][2], bool& fullRate);
 // the paused park. False on a fixed screen showing the game's own shot.
 bool UiOnPanel();
 bool StereoEnabled();
+void RequestStereoMode(StereoMode mode);
+bool FrameWarpEnabled();
+bool AlternateScene();
+// Returns the sole eye to render, or -1 for the normal two-eye path.
+int AlternateEyeForFrame();
+// The camera still updates, but the fade-out uses the last completed eye pair.
+bool HoldingCameraHandoff();
 // This frame's eye offsets from the head on the head's axes (right, up, forward), in
 // metres; false until the frame's head pose has been acquired.
 // tanFov: each eye's render frustum (tan of left, right, up, down; head space) when
@@ -91,13 +105,16 @@ void PanelPixels(float widthDeg, uint32_t srcW, uint32_t srcH, uint32_t& w, uint
 // On the game's queue, before the panel image is rewritten: waits for the headset's
 // last read of it.
 void WaitPanelFree(ID3D12CommandQueue* queue);
+void WaitMarkersFree(ID3D12CommandQueue* queue);
 // The panel image for this frame is written (queued on `queue`): Present shows it.
 void PanelCaptured(ID3D12CommandQueue* queue, ID3D12Resource* image, uint32_t w, uint32_t h);
 // Copies `image` (the batch's frame image) into eye image `eye` on the game's render
 // queue (call right after that eye's run of the render batch).
-bool CaptureEye(int eye, ID3D12CommandQueue* queue, ID3D12Resource* image);
+bool CaptureEye(int eye, ID3D12CommandQueue* queue, ID3D12Resource* image, bool first, const afw::Frame* warp,
+                ID3D12Resource* markers);
 // Both eyes of this frame are captured: Present shows them side by side.
 void EyesCaptured(ID3D12CommandQueue* queue);
+void AlternateEyeCaptured(int eye);
 // From the command-list hooks: the game's copy of its finished frame into the back
 // buffer reveals the texture the render batch ends in (the eye capture source).
 void OnGameCopy(ID3D12Resource* dst, ID3D12Resource* src);

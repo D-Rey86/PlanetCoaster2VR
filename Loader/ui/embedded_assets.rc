@@ -1,0 +1,3 @@
+#include "../src/embedded_assets.h"
+
+PC2VR_MENU_SCRIPT_RESOURCE RCDATA "VRMenu.js"

@@ -21,8 +21,10 @@
 #include <vector>
 
 #include "camera_control.h"
+#include "camera_handoff.h"
 #include "game_state.h"
 #include "depth_probe.h"
+#include "afw_warp.h"
 #include "config_redirect.h"
 #include "control_settings.h"
 #include "input_hook.h"
@@ -32,6 +34,13 @@
 #include "panel_geometry.h"
 #include "vr_menu.h"
 #include "frustum_bounds.h"
+#include "world_pointer.h"
+#include "laser_controls.h"
+#include "motion_trace.h"
+#include "ride_panel_geometry.h"
+#include "build_scroll.h"
+#include "menu_pointer.h"
+#include "alternate_eyes.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -69,12 +78,16 @@ namespace {
     X(xrResultToString)                       \
     X(xrStringToPath)                         \
     X(xrCreateActionSet)                      \
+    X(xrDestroyActionSet)                     \
     X(xrCreateAction)                         \
     X(xrSuggestInteractionProfileBindings)    \
     X(xrAttachSessionActionSets)              \
     X(xrCreateActionSpace)                    \
     X(xrSyncActions)                          \
-    X(xrGetActionStatePose)
+    X(xrGetActionStatePose)                    \
+    X(xrGetActionStateBoolean)                 \
+    X(xrGetActionStateFloat)                   \
+    X(xrGetActionStateVector2f)
 
 struct Api {
     PFN_xrGetInstanceProcAddr getProc = nullptr;
@@ -95,6 +108,18 @@ bool Resolve(XrInstance instance, const char* name, T& out) {
 // ----------------------------------------------------------------- state --
 enum class Phase { Uninitialised, Ready, Failed };
 
+// OFXR's public OFXR_GetControlSnapshotV1 ABI. The OpenXR session owns the
+// layer module. An absent export or an incompatible snapshot uses the thin beam.
+struct OfxrSnapshotV1 {
+    uint32_t size=sizeof(OfxrSnapshotV1), version{};
+    struct { uint32_t size; int32_t enabled,backend,preset,scale,backward,motionVectors; } desired{};
+    uint64_t revision{};
+    uint32_t sessions{}, pending{}, bypass{}, ready{}, errors{};
+    int32_t lastError{};
+};
+static_assert(sizeof(OfxrSnapshotV1)==72 && offsetof(OfxrSnapshotV1,ready)==60);
+using ReadOfxrSnapshot=int (*)(OfxrSnapshotV1*);
+
 struct State {
     Phase phase = Phase::Uninitialised;
     XrInstance instance = XR_NULL_HANDLE;
@@ -104,6 +129,29 @@ struct State {
     XrSpace viewSpace = XR_NULL_HANDLE;
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool running = false;
+    bool motionEnabled = false, actionsSynced = false;
+    motion::Actions motionActions;
+    motion::ActionSets actionSets;
+    motion::Frame motionFrame{};
+    bool worldLaser = false;
+    ReadOfxrSnapshot readOfxr{};
+    ULONGLONG nextOfxrCheck{};
+    bool ofxrGenerating{};
+    HWND gameWindow{};
+    pointer::world::Frame worldPointer{};
+    bool worldEligible{};
+    bool handUiEligible{};
+    ULONGLONG handUiTime{};
+    motion::LaserControls laserControls;
+    motion::LaserInput laserInput{};
+    ui::RidePanelGeometry ridePanelControls;
+    ui::RidePanelGeometry buildPanelControls;
+    ui::BuildScroll buildScroll;
+    ui::BuildScroll dashboardScroll;
+    ui::StickScroll menuScroll;
+    bool menuLaser{}, menuAim{}, menuArmed{}, menuPointPublished{};
+    unsigned menuTarget{};
+    ui::RideGeometry ridePanel{};
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
@@ -217,6 +265,12 @@ struct State {
     ComPtr<IDXGISwapChain3> gameSwap;
     ComPtr<ID3D12Device> captureDevice;
     ComPtr<ID3D12Resource> eyeTex[2];  // kept in COPY_DEST between uses
+    ID3D12Resource* eyeMarkers[2]{};  // owned by ui_layer, paired with eyeTex
+    CameraHandoff cameraHandoff;
+    float handoffFade = 0.f;
+    bool handoffHolding = false, handoffSourceCrop = false;
+    uint64_t handoffSourceFrame = UINT64_MAX;
+    XrQuaternionf handoffSourceHead{}, handoffSourceEye[2]{};
     uint32_t eyeW = 0, eyeH = 0;
     DXGI_FORMAT eyeFormat = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D12CommandAllocator> copyAlloc[kRing][2];
@@ -226,9 +280,17 @@ struct State {
     uint64_t copyValue = 0;
     uint64_t copySlotValue[kRing][2] = {};
     int copyRing = 0;
-    bool eyesCaptured = false;   // both eyes of the current frame are in eyeTex
+    bool eyesCaptured = false;   // a fresh stereo pair or an AER pair in eyeTex
+    StereoMode stereoMode{};
+    bool alternateParkDepth{}, alternatePanel{};
+    AlternateEyes alternate;
+    ID3D12Resource* warpedEye{};
+    uint64_t warpedFrame{};
+    XrQuaternionf capturedEyeOrientation[2]{};
+    XrFovf capturedEyeFov[2]{};
     uint64_t eyesValue = 0;      // copyFence value once they are
     uint64_t lastBlitValue = 0;  // fence value after the last headset blit that read eyeTex
+    uint64_t lastMarkerBlitValue = 0;
     // Render size from the headset (Metro lesson: never one headset's numbers). The
     // runtime's recommended per-eye size (it includes the runtime's own resolution
     // setting) gives the pixel density; the eyes' own FOV gives the shape.
@@ -292,12 +354,21 @@ struct State {
     cbmath::Vec3 rideSeatF{}, rideSeatU{};
 } s;
 
+void ClearWorldPointer() {
+    s.worldPointer={};s.worldEligible=s.handUiEligible=false;
+    s.ridePanel.visible=false;s.ridePanel.hit={};
+    menu::RideInputSnapshot(false,0);
+    if (s.worldLaser) pointer::world::Clear();
+}
+
 // Shader-visible descriptors per frame in flight: each eye's game image and UI panel.
-constexpr int kSrvPerRing = 4;
+constexpr int kComposeSrvCount = 3;
+constexpr int kSrvPerRing = 2 * kComposeSrvCount;
 
 std::atomic<bool> g_recenterRequest{false};
 std::atomic<int> g_resolutionRequest{0};
 std::atomic<int> g_coverageRequest{0}; // 0=no request, 1=original, 2=expanded
+std::atomic<int> g_stereoModeRequest{-1};
 std::atomic<uint64_t> g_resolutionSize{0};
 // The engine FOV margin (head motion during the frame or two of lag) is s.fovMargin.
 constexpr float kMinBodyPitch = 0.26f;     // ~15 degrees below level
@@ -418,13 +489,10 @@ void SetUpGaze() {
     sb.interactionProfile = profile;
     sb.countSuggestedBindings = 1;
     sb.suggestedBindings = &bind;
-    XrSessionActionSetsAttachInfo at{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-    at.countActionSets = 1;
-    at.actionSets = &s.gazeSet;
     XrActionSpaceCreateInfo sci{XR_TYPE_ACTION_SPACE_CREATE_INFO};
     sci.action = s.gazeAction;
     sci.poseInActionSpace.orientation.w = 1.f;
-    if (XR_FAILED(g.xrSuggestInteractionProfileBindings(s.instance, &sb)) || XR_FAILED(g.xrAttachSessionActionSets(s.session, &at)) ||
+    if (XR_FAILED(g.xrSuggestInteractionProfileBindings(s.instance, &sb)) ||
         XR_FAILED(g.xrCreateActionSpace(s.session, &sci, &s.gazeSpace))) {
         LOG("OpenXR: eye gaze setup failed (bindings)");
         s.gazeSupported = false;
@@ -434,12 +502,7 @@ void SetUpGaze() {
 // The gaze direction in head space for this frame's display time, as tan(x), tan(y).
 void UpdateGaze() {
     s.gazeValid = false;
-    if (!s.gazeSupported || s.gazeSpace == XR_NULL_HANDLE) return;
-    XrActiveActionSet active{s.gazeSet, XR_NULL_PATH};
-    XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
-    sync.countActiveActionSets = 1;
-    sync.activeActionSets = &active;
-    if (XR_FAILED(g.xrSyncActions(s.session, &sync))) return;
+    if (!s.actionsSynced || !s.gazeSupported || s.gazeSpace == XR_NULL_HANDLE) return;
     XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
     gi.action = s.gazeAction;
     XrActionStatePose ps{XR_TYPE_ACTION_STATE_POSE};
@@ -456,6 +519,108 @@ void UpdateGaze() {
     if (!s.gazeLogged) {
         s.gazeLogged = true;
         LOG("OpenXR: eye gaze tracking active (gaze tan %.3f %.3f)", s.gazeTan[0], s.gazeTan[1]);
+    }
+}
+
+void SetUpActions() {
+    if (s.gazeSupported) SetUpGaze();
+    if (s.motionEnabled && input::MotionAvailable()) {
+        const motion::Api api{g.xrStringToPath, g.xrCreateActionSet, g.xrDestroyActionSet, g.xrCreateAction,
+            g.xrSuggestInteractionProfileBindings, g.xrCreateActionSpace, g.xrDestroySpace,
+            g.xrGetActionStatePose, g.xrGetActionStateBoolean, g.xrGetActionStateFloat,
+            g.xrGetActionStateVector2f, g.xrLocateSpace};
+        if (!s.motionActions.Create(api, s.instance, s.session)) LOG("motion: action setup failed; physical input retained");
+    }
+    if (!s.actionSets.Attach(g.xrAttachSessionActionSets, s.session,
+        s.gazeSupported && s.gazeSpace ? s.gazeSet : XR_NULL_HANDLE, s.motionActions.Set())) {
+        s.gazeSupported = false; s.motionActions.Destroy();
+        LOG("OpenXR: action attachment failed; input/gaze inactive");
+    }
+}
+void SyncActions() {
+    s.actionsSynced = false; s.motionFrame = {};
+    s.actionsSynced = s.actionSets.Sync(g.xrSyncActions, s.session, s.sessionState == XR_SESSION_STATE_FOCUSED);
+    const auto panel=s.worldLaser?menu::SelectionPanelState():motion::SelectionPanel{};
+    const auto settings=s.worldLaser?ui::Settings():ui::PanelSettings{};
+    const auto rideLayout=s.worldLaser?menu::RidePanelLayout():ui::RideLayout{};
+    const auto cameraLayout=s.worldLaser?menu::CameraPanelLayout():ui::RideLayout{};
+    const auto buildLayout=s.worldLaser?menu::BuildPanelLayout():ui::RideLayout{};
+    const auto dashboardLayout=s.worldLaser?menu::DashboardLayout():ui::RideLayout{};
+    const bool card=settings.on && settings.dashboard && dashboardLayout.visible && !buildLayout.visible && !rideLayout.visible;
+    s.motionFrame = s.motionActions.Read(s.session, s.localSpace, s.displayTime, s.actionsSynced,
+        s.worldLaser && settings.on && ((settings.ridePanel && (rideLayout.visible || cameraLayout.visible)) || card));
+    menu::BuildAvailability(s.worldLaser && s.actionsSynced);
+    const bool pause=menu::PauseVisible();
+    const bool inPark=gamestate::InPark();
+    s.motionFrame.menuNavigation=!inPark || pause;
+    if(pause && s.worldLaser)ClearWorldPointer();
+    if (s.worldLaser || s.menuLaser) {
+        const auto now=GetTickCount64();
+        const bool foreground=s.gameWindow && GetForegroundWindow()==s.gameWindow;
+        const unsigned menuTarget=s.menuLaser && foreground ? (pause ? 2u : !inPark ? 1u : 0u) : 0u;
+        const bool leavingMenu=s.menuTarget && !menuTarget;
+        if (s.menuTarget != menuTarget) {
+            if (s.menuPointPublished) pointer::menu::Clear();
+            s.menuPointPublished=false;
+            s.menuArmed=false;
+            s.menuTarget=menuTarget;
+        }
+        const bool camera=settings.on && settings.ridePanel && cameraLayout.visible && panel.known && !panel.blocked;
+        const bool available=s.worldLaser && !menuTarget && !pause && (s.worldEligible || (s.handUiEligible && camera));
+        const bool build=!camera && settings.on && settings.buildWheel && buildLayout.visible && available && s.worldEligible && panel.known && !panel.blocked;
+        const bool toast=!camera && card && !build && available && s.worldEligible && panel.known && !panel.blocked;
+        const auto layout=camera?cameraLayout:build?buildLayout:toast?dashboardLayout:rideLayout;
+        s.motionFrame.menuNavigation=s.motionFrame.menuNavigation || build || (camera && available);
+        s.ridePanel=s.ridePanelControls.Read(camera?cameraLayout:rideLayout,s.motionFrame,s.headPose,
+            settings.on && settings.ridePanel && !build && available && panel.known && !panel.blocked &&
+            s.motionFrame.hand[0].active && s.motionFrame.hand[0].aimValid,
+            settings.rideWidthM,false,true,true);
+        if(build || toast){
+            // The same renderer/texture holds one surface. Hand poses are the
+            // existing synchronized snapshot, shared with input and both eyes.
+            const bool consumed=s.ridePanel.consumeGrip;
+            s.ridePanel=s.buildPanelControls.Read(layout,s.motionFrame,s.headPose,
+                s.motionFrame.hand[0].active && s.motionFrame.hand[0].aimValid,build?.28f:.20f,false,build,toast,toast);
+            s.ridePanel.consumeGrip=consumed;
+        }
+        const bool hit=foreground && s.ridePanel.visible && s.ridePanel.hit.valid;
+        s.laserInput=s.laserControls.Read(s.motionFrame,now,!leavingMenu && (available || menuTarget),
+            panel,hit,build || camera || menuTarget);
+        const auto& right=s.motionFrame.hand[1];
+        s.menuAim=menuTarget && s.laserInput.enabled && right.active && right.aimValid;
+        if (s.menuAim) s.laserInput.gamepad.hand[1].stick={};
+        menu::RideInputSnapshot(s.actionsSynced && foreground && s.laserInput.enabled && available &&
+            s.motionFrame.hand[1].active && s.motionFrame.hand[1].aimValid,now);
+        if(s.ridePanel.consumeGrip)s.laserInput.gamepad.hand[0].grip=0;
+        const float sourceX=layout.x+s.ridePanel.hit.u*layout.width,sourceY=layout.y+s.ridePanel.hit.v*layout.height;
+        const bool dashboard=build && dashboardLayout.visible && sourceX>=dashboardLayout.x && sourceX<dashboardLayout.x+dashboardLayout.width &&
+            sourceY>=dashboardLayout.y && sourceY<dashboardLayout.y+dashboardLayout.height;
+        if(!dashboard)s.dashboardScroll.Reset();if(!build || dashboard)s.buildScroll.Reset();
+        const auto scroll=(dashboard?s.dashboardScroll:s.buildScroll).Read(dashboard?dashboardLayout:layout,build && hit && s.laserInput.enabled,sourceX,sourceY,s.motionFrame.hand[1].stick.y,now);
+        if(scroll.consume)s.laserInput.gamepad.hand[1].stick={};
+        if(s.laserInput.uiClick){
+            const ui::RideClick click{layout.owner,layout.sequence,now,
+                sourceX,sourceY,
+                reinterpret_cast<uintptr_t>(s.gameWindow)};
+            if(camera)menu::PostCameraClick(click);else if(build)menu::PostBuildClick(click);else if(toast)menu::PostDashboardClick(click);else menu::PostRideClick(click);
+        }else if(scroll.step){
+            const ui::RideClick click{layout.owner,layout.sequence,now,sourceX,sourceY,reinterpret_cast<uintptr_t>(s.gameWindow),scroll.step};
+            menu::PostBuildClick(click);
+        }
+        input::PublishMotion(s.laserInput.gamepad);
+    } else input::PublishMotion(s.motionFrame);
+#if defined(PC2VR_MOTION_INPUT_TRACE)
+    motiontrace::Context(GetTickCount64(),s.actionsSynced,gamestate::InPark(),pause,s.worldEligible,
+        s.worldLaser && s.laserInput.enabled,s.motionFrame,s.worldLaser ? s.laserInput.gamepad : s.motionFrame);
+#endif
+    if (!s.menuAim) {
+        if (s.menuPointPublished) pointer::menu::Clear();
+        s.menuPointPublished=false;
+        s.menuArmed=false;
+        s.menuScroll.Reset();
+    }
+    if (s.worldLaser && (!s.motionFrame.hand[1].active || !s.motionFrame.hand[1].aimValid)) {
+        ClearWorldPointer();
     }
 }
 
@@ -487,6 +652,8 @@ bool CreateSession(ID3D12CommandQueue* queue) {
     ci.next = &binding;
     ci.systemId = s.system;
     XR_CHECK(g.xrCreateSession(s.instance, &ci, &s.session));
+    if (HMODULE bridge=GetModuleHandleW(L"XR_APILAYER_XRFrameBridge_diagnostic.dll"))
+        s.readOfxr=reinterpret_cast<ReadOfxrSnapshot>(GetProcAddress(bridge,"OFXR_GetControlSnapshotV1"));
     s.eyeFovValid = false;  // session recommendations can change even if its FOV does not
     s.pixelDensity = s.panelDensity = 0.f;
     {
@@ -518,7 +685,7 @@ bool CreateSession(ID3D12CommandQueue* queue) {
     XR_CHECK(g.xrCreateReferenceSpace(s.session, &rs, &s.localSpace));
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     XR_CHECK(g.xrCreateReferenceSpace(s.session, &rs, &s.viewSpace));
-    if (s.gazeSupported) SetUpGaze();
+    SetUpActions();
     LOG("OpenXR: session created on the game's device");
     return true;
 }
@@ -625,18 +792,24 @@ struct ComposeConstants {
     float scene[3][4];
     float panelCentre[4], panelX[4], panelY[4], panelN[4];
     float pixel[4];
+    float laserOrigin[4], laserDirection[4]; // w: radius, signed length (+hit/-miss)
+    float markerTan[3]; // left, right, up. The tracked path uses pixel.z for down.
 };
-static_assert(sizeof(ComposeConstants) == 13 * 16, "compose constants");
+static_assert(sizeof(ComposeConstants) == 63 * sizeof(float), "compose constants");
+static_assert(sizeof(ComposeConstants)/4+1 <= 64, "D3D12 root budget including descriptor table");
 
 bool CreateComposePipeline(DXGI_FORMAT rtvFormat) {
     static const char* kShader = R"(
 Texture2D scene : register(t0);
 Texture2D panel : register(t1);
+Texture2D markers : register(t2);
 SamplerState smp : register(s0);
 cbuffer C : register(b0) {
     float4 outTan; float4 out0; float4 out1; float4 out2;
     float4 sceneTan; float4 sc0; float4 sc1; float4 sc2;
     float4 pCentre; float4 pX; float4 pY; float4 pN; float4 pixel;
+    float4 laserOrigin; float4 laserDirection;
+    float3 markerTan;
 };
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 V VS(uint id : SV_VertexID) {
@@ -651,41 +824,128 @@ float3 Ray(float2 uv) {
     float3 d = float3(lerp(outTan.x, outTan.y, uv.x), lerp(outTan.z, outTan.w, uv.y), -1);
     return float3(dot(out0.xyz, d), dot(out1.xyz, d), dot(out2.xyz, d));
 }
+bool CaptureUv(float2 uv, float4 captureTan, out float2 sourceUv) {
+    float3 d = float3(lerp(outTan.x, outTan.y, uv.x), lerp(outTan.z, outTan.w, uv.y), -1);
+    const float3 q = float3(pCentre.w, pX.w, pY.w);
+    const float3 cross2 = 2 * cross(q,d);
+    d += sqrt(max(0,1-dot(q,q)))*cross2 + cross(q,cross2);
+    sourceUv = 0;
+    if (d.z >= -1e-4) return false;
+    const float2 t = d.xy / -d.z;
+    sourceUv = float2((t.x-captureTan.x)/(captureTan.y-captureTan.x),(captureTan.z-t.y)/(captureTan.z-captureTan.w));
+    return all(sourceUv >= 0) && all(sourceUv <= 1);
+}
 // The game image (sRGB-encoded UNORM) in linear light; black outside a fixed screen.
 float3 Scene(float2 uv) {
-    if (out0.w < 0.5) return Decode(saturate(scene.SampleLevel(smp, uv, 0).rgb));
+    if (out0.w < 0.5) {
+        if ((uint(pixel.w) & 1u) != 0) {
+            // Only the cached AER eye needs rotational reprojection. Panel and
+            // laser rays below still use this frame's current output view.
+            float2 reprojected;
+            if (!CaptureUv(uv, outTan, reprojected)) return 0;
+            uv = reprojected;
+        }
+        return Decode(saturate(scene.SampleLevel(smp, uv, 0).rgb));
+    }
     float3 d = Ray(uv);
     float3 s = float3(dot(sc0.xyz, d), dot(sc1.xyz, d), dot(sc2.xyz, d));
     if (s.z > -1e-4) return 0;
+    // A menu screen has a finite plane, expressed in shot space. Intersect
+    // from this eye so the image and pointer share binocular disparity.
     float2 t = s.xy / -s.z;
+    if (pixel.z > 0) {
+        const float3 eye = float3(sc0.w, sc1.w, sc2.w);
+        t = (eye.xy + s.xy * ((-pixel.z - eye.z) / s.z)) / pixel.z;
+    }
     float2 suv = float2((t.x - sceneTan.x) / (sceneTan.y - sceneTan.x), (sceneTan.z - t.y) / (sceneTan.z - sceneTan.w));
     if (any(suv < 0) || any(suv > 1)) return 0;
     return Decode(saturate(scene.SampleLevel(smp, suv, 0).rgb));
+}
+float3 Laser(float3 c,float3 localRay) {
+        // Closest points between this eye ray and the controller's finite beam.
+        // Native picker distance is shared by both eyes; no extra scene query.
+        float3 d = normalize(localRay);
+        float db = dot(d, laserDirection.xyz);
+        float u = clamp((dot(d, laserOrigin.xyz)*db - dot(laserDirection.xyz, laserOrigin.xyz)) /
+                        max(1e-6, 1-db*db), 0, abs(laserDirection.w));
+        float3 p = laserOrigin.xyz + u*laserDirection.xyz;
+        float t = dot(p,d);
+        float distance = length(p-max(t,0)*d);
+        float aa = max(fwidth(distance),1e-5);
+        float coverage = t > 0 ? 1-smoothstep(laserOrigin.w-aa,laserOrigin.w+aa,distance) : 0;
+        c = lerp(c,float3(0.05,0.8,1),coverage);
+        if (laserDirection.w > 0) {
+            float3 end = laserOrigin.xyz + laserDirection.w*laserDirection.xyz;
+            float endT = dot(end,d);
+            float endDistance = length(end-max(endT,0)*d);
+            float endAa = max(fwidth(endDistance),1e-5);
+            // Eight-mm dot, with a two-pixel minimum for runtime resolution.
+            float radius = max(0.008,2*endAa);
+            float dotCoverage = endT > 0 ? 1-smoothstep(radius-endAa,radius+endAa,endDistance) : 0;
+            c = lerp(c,float3(1,1,1),dotCoverage);
+        }
+    return c;
 }
 float4 PS(V i) : SV_Target {
     float3 c;
     if (out0.w < 0.5) {
         c = Scene(i.uv);
+        if ((uint(pixel.w) & 2u) != 0) {
+            float2 uv = i.uv;
+            if ((uint(pixel.w) & 4u) != 0) {
+                if (!CaptureUv(i.uv, float4(markerTan, pixel.z), uv)) uv = -1;
+            }
+            if (all(uv >= 0)) {
+                float4 m = markers.SampleLevel(smp, uv, 0);
+                c = c * (1 - m.a) + m.rgb;
+            }
+        }
     } else {
         // A fixed screen is denser than the eye's view (a 60-degree shot rendered at the
         // eye's size): 2x2 samples per output pixel instead of one.
         c = 0.25 * (Scene(i.uv + pixel.xy * float2(-0.25, -0.25)) + Scene(i.uv + pixel.xy * float2(0.25, -0.25)) +
                     Scene(i.uv + pixel.xy * float2(-0.25, 0.25)) + Scene(i.uv + pixel.xy * float2(0.25, 0.25)));
     }
+    float3 localRay = 0;
+    if (laserDirection.w != 0 || out1.w > 0.5) localRay = Ray(i.uv);
+    if (laserDirection.w != 0 && pN.w == 0 && !(out2.w > .5 && sc1.w > .5)) c=Laser(c,localRay);
     if (out1.w > 0.5) {
-        float3 d = Ray(i.uv);
+        float3 d = localRay;
         float den = dot(d, pN.xyz);
         if (abs(den) > 1e-6) {
             float t = dot(pCentre.xyz, pN.xyz) / den;
             float3 h = d * t - pCentre.xyz;
             float2 puv = float2(0.5 + dot(h, pX.xyz), 0.5 - dot(h, pY.xyz));
             if (t > 0 && all(puv >= 0) && all(puv <= 1)) {
-                float4 p = panel.SampleLevel(smp, puv, 0);  // premultiplied, linear (sRGB view)
-                c = c * (1 - p.a) + p.rgb;
+                const bool moved=out2.w > .5 && all(puv >= sceneTan.xy) && all(puv <= sceneTan.xy+sceneTan.zw);
+                if(!moved){
+                    float4 p = panel.SampleLevel(smp, puv, 0);  // premultiplied, linear (sRGB view)
+                    c = c * (1 - p.a) + p.rgb;
+                }
             }
         }
     }
-    return float4(c, 1);
+    if(out2.w > .5){
+        const float3 normal=cross(sc1.xyz,sc2.xyz);
+        const float den=dot(localRay,normal);
+        if(den < -1e-6){
+            const float t=dot(sc0.xyz,normal)/den;
+            const float3 h=localRay*t-sc0.xyz;
+            const float2 uv=float2(.5+dot(h,sc1.xyz),.5-dot(h,sc2.xyz));
+            if(t > 0 && all(uv >= 0) && all(uv <= 1)){
+                const float2 source=sceneTan.xy+uv*sceneTan.zw;
+                const float4 p=panel.SampleLevel(smp,source,0);
+                c=c*(1-p.a)+p.rgb;
+            }
+        }
+        // Only a beam aimed at the floating panel goes over its pixels. Every
+        // other scene/menu/ride beam keeps the accepted composition order.
+        if(laserDirection.w != 0 && sc1.w > .5)c=Laser(c,localRay);
+    }
+    if (laserDirection.w != 0 && pN.w > 0)c=Laser(c,localRay);
+    // Integer bits select the capture path. The fractional half-range carries
+    // blackout, keeping the root signature within its existing 64 DWORD budget.
+    return float4(c * (1 - 2 * frac(pixel.w)), 1);
 }
 )";
     ComPtr<ID3DBlob> vs, ps, err;
@@ -695,7 +955,7 @@ float4 PS(V i) : SV_Target {
         return false;
     }
     if (!s.composeRootSig) {
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kComposeSrvCount, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable.NumDescriptorRanges = 1;
@@ -957,14 +1217,15 @@ void PlaceScreen(XrCompositionLayerQuad& quad, const XrRect2Di& rect) {
 // The game's UI panel: in the recentred direction (it stays in front of your body while
 // the stick turns the park), at the panel's distance, centre heightDeg above or below eye
 // level and tilted to face you, widthDeg wide; the UI layer's shape. Pose in local space.
-void PanelGeometry(XrPosef& pose, float& width, float& height, const ui::PanelSettings& p) {
+struct PanelSurface { XrPosef pose{}; float width{},height{}; };
+PanelSurface PanelGeometry(const ui::PanelSettings& p) {
     const float yaw = s.headYaw0, d = p.distanceM;
-    width = 2.f * d * std::tan(0.5f * p.widthDeg * 0.0174533f);
-    height = width * s.panelH / static_cast<float>(std::max(1u, s.panelW));
+    const float width = 2.f * d * std::tan(0.5f * p.widthDeg * 0.0174533f);
+    const float height = width * s.panelH / static_cast<float>(std::max(1u, s.panelW));
     // From where the head was when recentred: the local space's origin is wherever the
     // runtime put it (floor level on some), not necessarily the head.
     const XrPosef anchor{{0.f,std::sin(-yaw*.5f),0.f,std::cos(-yaw*.5f)},s.headPos0};
-    pose=ui::PanelPose(p,anchor,s.headPose,s.headPositionValid);
+    return {ui::PanelPose(p,anchor,s.headPose,s.headPositionValid),width,height};
 }
 
 // The game image covers both eyes plus a margin, centred on the head. Each eye gets
@@ -1045,11 +1306,12 @@ void RecordBlit(ID3D12Resource* src, DXGI_FORMAT format, D3D12_RESOURCE_STATES s
 // UNORM), drawn over the eye's swapchain image with the constants' view, and the UI
 // panel image over it when `panel` is set.
 void RecordCompose(ID3D12Resource* src, DXGI_FORMAT format, D3D12_RESOURCE_STATES srcState, int eye,
-                   D3D12_CPU_DESCRIPTOR_HANDLE rtv, ID3D12Resource* panel, const ComposeConstants& c) {
+                   D3D12_CPU_DESCRIPTOR_HANDLE rtv, ID3D12Resource* panel, ID3D12Resource* markers,
+                   const ComposeConstants& c) {
     D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = s.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    srvCpu.ptr += static_cast<SIZE_T>(s.ring * kSrvPerRing + eye * 2) * s.srvStride;
+    srvCpu.ptr += static_cast<SIZE_T>(s.ring * kSrvPerRing + eye * kComposeSrvCount) * s.srvStride;
     D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = s.srvHeap->GetGPUDescriptorHandleForHeapStart();
-    srvGpu.ptr += static_cast<UINT64>(s.ring * kSrvPerRing + eye * 2) * s.srvStride;
+    srvGpu.ptr += static_cast<UINT64>(s.ring * kSrvPerRing + eye * kComposeSrvCount) * s.srvStride;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = format;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1061,6 +1323,8 @@ void RecordCompose(ID3D12Resource* src, DXGI_FORMAT format, D3D12_RESOURCE_STATE
     sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     srvCpu.ptr += s.srvStride;
     s.device->CreateShaderResourceView(panel, &sv, srvCpu);
+    srvCpu.ptr += s.srvStride;
+    s.device->CreateShaderResourceView(markers, &sv, srvCpu);
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1069,6 +1333,12 @@ void RecordCompose(ID3D12Resource* src, DXGI_FORMAT format, D3D12_RESOURCE_STATE
     b.Transition.StateBefore = srcState;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     if (srcState != b.Transition.StateAfter) s.list->ResourceBarrier(1, &b);
+    D3D12_RESOURCE_BARRIER markerBarrier = b;
+    if (markers) {
+        markerBarrier.Transition.pResource = markers;
+        markerBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        s.list->ResourceBarrier(1, &markerBarrier);
+    }
 
     ID3D12DescriptorHeap* heaps[] = {s.srvHeap.Get()};
     s.list->SetDescriptorHeaps(1, heaps);
@@ -1086,6 +1356,10 @@ void RecordCompose(ID3D12Resource* src, DXGI_FORMAT format, D3D12_RESOURCE_STATE
 
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     if (srcState != b.Transition.StateBefore) s.list->ResourceBarrier(1, &b);
+    if (markers) {
+        std::swap(markerBarrier.Transition.StateBefore, markerBarrier.Transition.StateAfter);
+        s.list->ResourceBarrier(1, &markerBarrier);
+    }
 }
 
 // The view an eye's image is submitted with this frame, and what goes into it.
@@ -1094,10 +1368,30 @@ struct EyeOutput {
     XrFovf fov;        // of the whole swapchain image (before any crop)
     bool fixedScreen;  // the game's shot turned into the eye's own view
     bool crop;         // cropped to the eye's FOV on submit (head-driven, oversized image)
+    bool reuse{};
+    XrQuaternionf fromOutputToCapture{};
+    ID3D12Resource* markers{};
+    bool reuseMarkers{};
+    XrFovf markerFov{};
 };
 
 EyeOutput EyeOutputFor(int eye, bool eyes) {
     EyeOutput o{};
+    if (s.handoffHolding) {
+        const auto& head = s.handoffSourceHead;
+        const auto& captured = s.capturedEyeOrientation[eye];
+        o.pose = s.eyeViewPose[eye];
+        const auto turn = ui::Multiply({-head.x, -head.y, -head.z, head.w}, s.headPose.orientation);
+        o.pose.orientation = ui::Multiply(s.handoffSourceEye[eye], turn);
+        o.fov = s.capturedEyeFov[eye];
+        o.crop = s.handoffSourceCrop;
+        o.reuse = true;
+        o.fromOutputToCapture = ui::Multiply({-captured.x,-captured.y,-captured.z,captured.w}, o.pose.orientation);
+        o.markers = s.eyeMarkers[eye];
+        o.reuseMarkers = o.markers != nullptr;
+        o.markerFov = o.fov;
+        return o;
+    }
     if (s.engineView && !s.shownDriven) {
         o.pose = s.eyeViewPose[eye];
         o.fov = s.eyeViewFov[eye];
@@ -1107,10 +1401,64 @@ EyeOutput EyeOutputFor(int eye, bool eyes) {
     o.pose = eyes ? s.eyeSubmitPose[eye] : s.submitPose;
     o.fov = (eyes && s.perEyeProjection) ? s.eyeRenderFovFrame[eye] : s.submitFov;
     o.crop = eyes && s.submitEyeFov;
+    o.markers = eyes ? s.eyeMarkers[eye] : nullptr;
+    if (eyes && s.alternate.ReusedEye(s.frames) == eye) {
+        o.reuse = !(s.warpedEye && s.warpedFrame == s.frames);
+        o.reuseMarkers = o.markers != nullptr;
+        o.markerFov = s.capturedEyeFov[eye];
+        if (o.reuse) o.fov = o.markerFov;
+        const auto& q = s.capturedEyeOrientation[eye];
+        o.fromOutputToCapture = ui::Multiply({-q.x,-q.y,-q.z,q.w},o.pose.orientation);
+    }
     return o;
 }
 
-ComposeConstants ComposeConstantsFor(const EyeOutput& o, bool panel, const ui::PanelSettings& panelSettings) {
+pointer::menu::Screen MenuScreen(const ui::PanelSettings& settings) {
+    const auto q=settings.followHmd ? ui::Multiply(s.headPose.orientation,ui::PanelOffset(settings)) : s.submitPose.orientation;
+    return {{q,s.headPose.position},std::tan(s.submitFov.angleLeft),std::tan(s.submitFov.angleRight),
+        std::tan(s.submitFov.angleUp),std::tan(s.submitFov.angleDown),2.5f};
+}
+
+pointer::world::Beam MenuBeam(const PanelSurface& panel, const pointer::menu::Screen& screen,
+                              ULONGLONG now, float& radius) {
+    const auto& hand=s.motionFrame.hand[1];
+    pointer::world::Beam beam{};
+    beam.local=pointer::AimRay(hand.aim);
+    radius=.0015f;
+    pointer::Hit hit{};
+    if (panel.width>0) {
+        hit=pointer::Quad(beam.local,panel.pose,panel.width,panel.height);
+    } else if (screen.distance>0) {
+        hit=screen.Intersect(beam.local);
+    }
+    if (hit.valid) {
+        beam.hit=true;
+        beam.length=hit.distance;
+        RECT client{};
+        if (GetClientRect(s.gameWindow,&client) && client.right>0 && client.bottom>0) {
+            const POINT point{
+                std::min(client.right-1,static_cast<LONG>(hit.u*client.right)),
+                std::min(client.bottom-1,static_cast<LONG>(hit.v*client.bottom))};
+            if (!hand.primary && !hand.thumb) s.menuArmed=true;
+            const auto step=s.menuScroll.Read(-hand.stick.y,s.menuTarget,now);
+            pointer::menu::Publish(s.gameWindow,point,s.menuArmed && hand.primary,step,now);
+            s.menuPointPublished=true;
+            return beam;
+        }
+    }
+    if (s.menuPointPublished) pointer::menu::Clear();
+    s.menuPointPublished=false;
+    s.menuArmed=false;
+    s.menuScroll.Reset();
+    // A miss ends before the screen depth. It has no dot or mouse target.
+    beam.length=.65f;
+    return beam;
+}
+
+ComposeConstants ComposeConstantsFor(const EyeOutput& o, bool panel, const ui::PanelSettings& panelSettings, float laserRadius,
+                                    pointer::world::Beam beam={},const ui::RidePaint& ridePaint={},
+                                    const pointer::menu::Screen& screen={},bool menuBeam=false,
+                                    const PanelSurface& surface={}) {
     ComposeConstants c{};
     c.outTan[0] = std::tan(o.fov.angleLeft);
     c.outTan[1] = std::tan(o.fov.angleRight);
@@ -1126,25 +1474,31 @@ ComposeConstants ComposeConstantsFor(const EyeOutput& o, bool panel, const ui::P
     c.out[0][3] = o.fixedScreen ? 1.f : 0.f;
     c.out[1][3] = panel ? 1.f : 0.f;
     if (o.fixedScreen) {
-        c.sceneTan[0] = std::tan(s.submitFov.angleLeft);
-        c.sceneTan[1] = std::tan(s.submitFov.angleRight);
-        c.sceneTan[2] = std::tan(s.submitFov.angleUp);
-        c.sceneTan[3] = std::tan(s.submitFov.angleDown);
+        c.sceneTan[0] = screen.distance>0 ? screen.left : std::tan(s.submitFov.angleLeft);
+        c.sceneTan[1] = screen.distance>0 ? screen.right : std::tan(s.submitFov.angleRight);
+        c.sceneTan[2] = screen.distance>0 ? screen.up : std::tan(s.submitFov.angleUp);
+        c.sceneTan[3] = screen.distance>0 ? screen.down : std::tan(s.submitFov.angleDown);
         // Local space to the shot's view: the shot's axes as rows.
         // Fixed screens keep their native picture and UI together. Following the HMD
         // rotates the whole shot, avoiding the old menu/globe separation regression.
-        const auto q = panelSettings.followHmd ? ui::Multiply(s.headPose.orientation,ui::PanelOffset(panelSettings)) : s.submitPose.orientation;
+        const auto q = screen.distance>0 ? screen.origin.orientation :
+            panelSettings.followHmd ? ui::Multiply(s.headPose.orientation,ui::PanelOffset(panelSettings)) : s.submitPose.orientation;
         const cbmath::Vec3 rows[3] = {Rotate(q, {1, 0, 0}), Rotate(q, {0, 1, 0}), Rotate(q, {0, 0, 1})};
         for (int i = 0; i < 3; ++i) {
             c.scene[i][0] = rows[i].x;
             c.scene[i][1] = rows[i].y;
             c.scene[i][2] = rows[i].z;
         }
+        if (screen.distance>0) {
+            const cbmath::Vec3 eye={o.pose.position.x-screen.origin.position.x,o.pose.position.y-screen.origin.position.y,
+                o.pose.position.z-screen.origin.position.z};
+            for (int i=0;i<3;++i)c.scene[i][3]=cbmath::Dot(eye,rows[i]);
+            c.pixel[2]=screen.distance;
+        }
     }
     if (panel) {
-        XrPosef pp;
-        float w, h;
-        PanelGeometry(pp, w, h, panelSettings);
+        const auto& pp=surface.pose;
+        const float w=surface.width, h=surface.height;
         const cbmath::Vec3 px = Rotate(pp.orientation, {1, 0, 0}), py = Rotate(pp.orientation, {0, 1, 0}),
                            pn = Rotate(pp.orientation, {0, 0, 1});
         const float centre[3] = {pp.position.x - o.pose.position.x, pp.position.y - o.pose.position.y,
@@ -1155,8 +1509,53 @@ ComposeConstants ComposeConstantsFor(const EyeOutput& o, bool panel, const ui::P
         memcpy(c.panelY, ay, sizeof(ay));
         memcpy(c.panelN, an, sizeof(an));
     }
+    // World rendering does not use the fixed-screen source transform. Reuse
+    // those existing constant rows for a cropped projection of the SAME UI
+    // texture: no new surface, descriptor, camera, resource or render pass.
+    if(panel && !o.fixedScreen && s.ridePanel.visible && ridePaint.width>0){
+        const auto& ride=s.ridePanel;const auto& paint=ridePaint;
+        c.out[2][3]=1;
+        c.sceneTan[0]=paint.x;c.sceneTan[1]=paint.y;
+        c.sceneTan[2]=paint.sourceWidth;c.sceneTan[3]=paint.sourceHeight;
+        const auto& right=paint.right;const auto& up=paint.up;
+        c.scene[0][0]=paint.pose.position.x-o.pose.position.x;
+        c.scene[0][1]=paint.pose.position.y-o.pose.position.y;
+        c.scene[0][2]=paint.pose.position.z-o.pose.position.z;
+        c.scene[1][3]=s.laserInput.enabled && ride.hit.valid ? 1.f:0.f;
+        c.scene[1][0]=right.x/paint.width;c.scene[1][1]=right.y/paint.width;c.scene[1][2]=right.z/paint.width;
+        c.scene[2][0]=up.x/paint.height;c.scene[2][1]=up.y/paint.height;c.scene[2][2]=up.z/paint.height;
+    }
     c.pixel[0] = 1.f / static_cast<float>(s.swapW);
     c.pixel[1] = 1.f / static_cast<float>(s.swapH);
+    if (o.reuse || o.reuseMarkers) {
+        const auto& q = o.fromOutputToCapture;
+        const float sign = q.w < 0.f ? -1.f : 1.f;
+        c.panelCentre[3] = sign*q.x;
+        c.panelX[3] = sign*q.y;
+        c.panelY[3] = sign*q.z;
+    }
+    if (o.reuse) c.pixel[3] = 1.f;
+    if (o.markers) c.pixel[3] += 2.f;
+    if (o.reuseMarkers) {
+        c.markerTan[0] = std::tan(o.markerFov.angleLeft);
+        c.markerTan[1] = std::tan(o.markerFov.angleRight);
+        c.markerTan[2] = std::tan(o.markerFov.angleUp);
+        c.pixel[2] = std::tan(o.markerFov.angleDown);
+        c.pixel[3] += 4.f;
+    }
+    c.pixel[3] += .5f * s.handoffFade;
+    if (laserRadius>0 && (!o.fixedScreen || menuBeam)) {
+        c.panelN[3]=menuBeam ? 1.f : 0.f;
+        const auto& ray=beam.local;
+        c.laserOrigin[0]=ray.origin.x-o.pose.position.x;
+        c.laserOrigin[1]=ray.origin.y-o.pose.position.y;
+        c.laserOrigin[2]=ray.origin.z-o.pose.position.z;
+        c.laserOrigin[3]=laserRadius;
+        c.laserDirection[0]=ray.direction.x;
+        c.laserDirection[1]=ray.direction.y;
+        c.laserDirection[2]=ray.direction.z;
+        c.laserDirection[3]=beam.hit ? beam.length : -beam.length;
+    }
     return c;
 }
 
@@ -1207,19 +1606,67 @@ void SubmitFrame(IDXGISwapChain* swapChain) {
 
                 // Both eyes of this frame were captured from the game's render batch;
                 // otherwise (menus, loading) the one image goes to both.
-                const bool eyes = s.stereo && s.eyesCaptured && s.eyeTex[0] && s.eyeTex[1];
+                const bool eyes = s.stereo && (s.eyesCaptured || s.handoffHolding) && s.eyeTex[0] && s.eyeTex[1];
                 const auto panelSettings=ui::Settings(); // one snapshot for both eyes
+                const auto now=GetTickCount64();
+                const bool worldBeam=s.worldPointer.valid && now>=s.worldPointer.time && now-s.worldPointer.time<=250;
+                const bool uiBeam=s.handUiEligible && s.actionsSynced && s.laserInput.enabled && s.ridePanel.visible &&
+                    s.motionFrame.hand[1].active && s.motionFrame.hand[1].aimValid && now>=s.handUiTime && now-s.handUiTime<=250;
+                const bool foreground=(worldBeam || uiBeam || s.menuAim) && GetForegroundWindow()==s.gameWindow;
+                const bool laser=(worldBeam || uiBeam) && foreground;
+                auto beam=worldBeam ? pointer::world::ReadBeam(s.worldPointer,now) : pointer::world::Beam{};
+                if(uiBeam && !worldBeam)beam.local=pointer::AimRay(s.motionFrame.hand[1].aim);
+                if(laser && s.laserInput.enabled && s.ridePanel.visible && s.ridePanel.hit.valid){
+                    beam.local=pointer::AimRay(s.motionFrame.hand[1].aim);
+                    beam.length=s.ridePanel.hit.distance;beam.hit=true;
+                }
+                const auto ridePaint=ui::PaintGeometry(s.ridePanel,s.panelW,s.panelH); // shared by both eyes
+                float laserRadius=laser ? .0015f : 0.f;
+                if (laser && worldBeam && !(s.ridePanel.visible && s.ridePanel.hit.valid) && s.readOfxr) {
+                    if (now>=s.nextOfxrCheck) {
+                        OfxrSnapshotV1 status{};
+                        s.ofxrGenerating=s.readOfxr(&status)==1 && status.version==1 && status.desired.enabled &&
+                            status.sessions==1 && status.ready==1 && !status.pending && !status.bypass && !status.errors;
+                        s.nextOfxrCheck=now+1000;
+                    }
+                    // Extra beam coverage survives interpolation during hand sweeps.
+                    // Dot, native collision point and ray remain shared by both eyes.
+                    if (s.ofxrGenerating) laserRadius=.003f;
+                }
+                const bool fixed=s.engineView && !s.shownDriven;
+                const auto screen=s.poseAcquired && s.menuTarget && fixed && !panelOn ?
+                    MenuScreen(panelSettings) : pointer::menu::Screen{};
+                const auto surface=panelOn ? PanelGeometry(panelSettings) : PanelSurface{};
+                const bool menuBeam=s.menuAim && foreground && s.poseAcquired && (panelOn || screen.distance>0);
+                if (menuBeam) {
+                    beam=MenuBeam(surface,screen,now,laserRadius);
+                } else if (s.menuPointPublished) {
+                    pointer::menu::Clear();
+                    s.menuPointPublished=false;
+                    s.menuArmed=false;
+                    s.menuScroll.Reset();
+                }
+                bool readMarkers = false;
                 for (int e = 0; e < 2; ++e) {
                     D3D12_CPU_DESCRIPTOR_HANDLE rtv = s.rtvHeap[e]->GetCPUDescriptorHandleForHeapStart();
                     rtv.ptr += static_cast<SIZE_T>(index[e]) * s.rtvStride;
-                    ID3D12Resource* src = eyes ? s.eyeTex[e].Get() : backBuffer.Get();
-                    const DXGI_FORMAT fmt = eyes ? s.eyeFormat : desc.Format;
-                    const D3D12_RESOURCE_STATES state = eyes ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_PRESENT;
-                    if (s.poseAcquired)
-                        RecordCompose(src, fmt, state, e, rtv, panelOn ? s.panelImage : nullptr,
-                                      ComposeConstantsFor(EyeOutputFor(e, eyes), panelOn, panelSettings));
-                    else
+                    const bool warped = eyes && !s.handoffHolding && s.warpedEye && s.warpedFrame == s.frames &&
+                        s.alternate.ReusedEye(s.frames) == e;
+                    ID3D12Resource* src = warped ? s.warpedEye : eyes ? s.eyeTex[e].Get() : backBuffer.Get();
+                    const DXGI_FORMAT fmt = warped ? DXGI_FORMAT_R8G8B8A8_UNORM : eyes ? s.eyeFormat : desc.Format;
+                    const D3D12_RESOURCE_STATES state = warped ? D3D12_RESOURCE_STATE_COMMON :
+                        eyes ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_PRESENT;
+                    if (s.poseAcquired && s.handoffFade >= 1.f) {
+                        const float black[] = {0.f, 0.f, 0.f, 1.f};
+                        s.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+                    } else if (s.poseAcquired) {
+                        const auto out = EyeOutputFor(e, eyes);
+                        RecordCompose(src, fmt, state, e, rtv, panelOn ? s.panelImage : nullptr, out.markers,
+                                      ComposeConstantsFor(out, panelOn, panelSettings, laserRadius,beam,ridePaint,screen,menuBeam,surface));
+                        readMarkers |= out.markers != nullptr;
+                    } else {
                         RecordBlit(src, fmt, state, e, rtv);
+                    }
                 }
                 s.list->Close();
                 // The eyes and the panel image were written on the game's render queue;
@@ -1230,6 +1677,7 @@ void SubmitFrame(IDXGISwapChain* swapChain) {
                 s.fenceValue[s.ring] = s.nextFence++;
                 s.queue->Signal(s.fence.Get(), s.fenceValue[s.ring]);
                 if (eyes || panelOn) s.lastBlitValue = s.fenceValue[s.ring];
+                if (readMarkers) s.lastMarkerBlitValue = s.fenceValue[s.ring];
 
             }
             for (int e = 0; e < acquired; ++e) {
@@ -1237,12 +1685,14 @@ void SubmitFrame(IDXGISwapChain* swapChain) {
                 g.xrReleaseSwapchainImage(s.swapchain[e], &ri);
             }
             if (acquired == 2) {
-                const bool eyes = s.stereo && s.eyesCaptured && s.eyeTex[0] && s.eyeTex[1];
+                const bool eyes = s.stereo && (s.eyesCaptured || s.handoffHolding) && s.eyeTex[0] && s.eyeTex[1];
                 const XrRect2Di rect{{0, 0}, {static_cast<int32_t>(s.swapW), static_cast<int32_t>(s.swapH)}};
                 if (s.poseAcquired) {
                     // A head-tracked 3D frame: shown with the pose it was rendered with (per
                     // eye in stereo, where each eye was rendered from its own position); a
                     // fixed screen, with the eye's own view it was composed into.
+                    const bool saveHandoff = eyes && s.eyesCaptured && s.shownDriven &&
+                        !s.handoffHolding && s.handoffFade == 0.f;
                     for (int i = 0; i < 2; ++i) {
                         XrCompositionLayerProjectionView& v = views[i];
                         const EyeOutput o = EyeOutputFor(i, eyes);
@@ -1251,6 +1701,12 @@ void SubmitFrame(IDXGISwapChain* swapChain) {
                         v.subImage.swapchain = s.swapchain[i];
                         v.subImage.imageRect = rect;
                         if (o.crop) CropToEye(i, v, o.fov);
+                        if (saveHandoff) s.handoffSourceEye[i] = o.pose.orientation;
+                    }
+                    if (saveHandoff) {
+                        s.handoffSourceFrame = s.frames;
+                        s.handoffSourceHead = s.headPose.orientation;
+                        s.handoffSourceCrop = s.submitEyeFov;
                     }
                     layer.space = s.localSpace;
                     layer.viewCount = 2;
@@ -1271,6 +1727,10 @@ void SubmitFrame(IDXGISwapChain* swapChain) {
     s.eyesCaptured = false;
     s.panelCaptured = false;
     const XrResult r = g.xrEndFrame(s.session, &ei);
+    if (!submitted || XR_FAILED(r)) {
+        s.alternate.Reset();
+        s.handoffSourceFrame = UINT64_MAX;
+    }
     if (XR_FAILED(r)) LOG("OpenXR: xrEndFrame %s", ResultStr(r));
     ++s.frames;
 }
@@ -1376,19 +1836,24 @@ void UpdateRenderSize(IDXGISwapChain* swapChain) {
 
 void OnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* presentQueue) {
     if (const int percent=g_resolutionRequest.exchange(0)) {
+        s.alternate.Reset();
         s.renderScale=percent/100.f;
         s.lastSizeCheck=0;
     }
     if (s.running) UpdateRenderSize(swapChain);
     if (++s.presents == 600) cfgredirect::LogStatus();
     if (swapChain != s.gameSwapRaw) {
+        s.alternate.Reset();
+        if (s.worldLaser) ClearWorldPointer();
         s.gameSwap.Reset();
         swapChain->QueryInterface(IID_PPV_ARGS(&s.gameSwap));
         s.gameSwapRaw = swapChain;
+        DXGI_SWAP_CHAIN_DESC windowDesc{};
+        s.gameWindow=SUCCEEDED(swapChain->GetDesc(&windowDesc)) ? windowDesc.OutputWindow : nullptr;
         RefreshBackBuffers();
     }
 
-    if (s.phase == Phase::Failed) return;
+    if (s.phase == Phase::Failed) { ClearWorldPointer(); input::PublishMotion({}); return; }
     if (s.phase == Phase::Uninitialised) {
         if (!presentQueue) return;  // wait until the render thread has submitted once
         s.phase = Phase::Failed;
@@ -1401,6 +1866,16 @@ void OnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* presentQueue) {
         SubmitFrame(swapChain);
         s.frameBegun = false;
     }
+    if (g_stereoModeRequest.load(std::memory_order_relaxed) >= 0) {
+        const int request = g_stereoModeRequest.exchange(-1,std::memory_order_relaxed);
+        if (request >= 0 && request != static_cast<int>(s.stereoMode)) {
+            s.stereoMode = static_cast<StereoMode>(request);
+            afw::SetEnabled(s.stereoMode == StereoMode::AFW);
+            afw::InvalidateHistory();
+            s.alternate.Reset();
+            s.warpedEye = nullptr;
+        }
+    }
     // Finish the old frame with its own geometry before switching the entire
     // policy. The next AcquireRenderView rebuilds both eyes before another resize.
     if (g_coverageRequest.load(std::memory_order_relaxed)) {
@@ -1408,6 +1883,7 @@ void OnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* presentQueue) {
         const bool expanded=request==2;
         if (expanded!=s.expandedCoverage) {
             s.expandedCoverage=expanded;
+            s.alternate.Reset();
             s.engineFovMax=frustum::CameraLimit(s.engineFovOverride,expanded);
             s.eyeFovValid=false;
             s.pixelDensity=s.panelDensity=0.f;
@@ -1416,20 +1892,41 @@ void OnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* presentQueue) {
         }
     }
     PollEvents();
-    if (!s.running || s.phase != Phase::Ready) return;
+    if (!s.running || s.phase != Phase::Ready) {
+        s.alternate.Reset();
+        ClearWorldPointer();
+        s.motionActions.Read(s.session, s.localSpace, s.displayTime, false);
+        input::PublishMotion({}); return;
+    }
 
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     const XrResult wr = g.xrWaitFrame(s.session, &wi, &fs);
-    if (XR_FAILED(wr)) return;
+    if (XR_FAILED(wr)) {
+        s.alternate.Reset();
+        ClearWorldPointer();
+        s.motionActions.Read(s.session, s.localSpace, s.displayTime, false);
+        input::PublishMotion({}); return;
+    }
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     const bool begun = XR_SUCCEEDED(g.xrBeginFrame(s.session, &bi));
-    if (!begun) return;
+    if (!begun) {
+        s.alternate.Reset();
+        ClearWorldPointer();
+        s.motionActions.Read(s.session, s.localSpace, s.displayTime, false);
+        input::PublishMotion({}); return;
+    }
     s.frameBegun = true;
     s.displayTime = fs.predictedDisplayTime;
     s.shouldRender = fs.shouldRender == XR_TRUE;
     s.poseAcquired = false;
+    s.handoffHolding = false;
+    SyncActions();
 }
+
+void SetMotionControllers(bool on) { s.motionEnabled = on; }
+void SetWorldLaser(bool on) { ClearWorldPointer(); s.worldLaser=on; }
+void SetMenuLaser(bool on) { s.menuLaser=on; }
 
 namespace {
 // ---- which camera the frame shows (State::driven) ----
@@ -1487,7 +1984,7 @@ void UpdateDriven(const cbmath::Vec3& renderedForward, float memYaw, float memPi
 }  // namespace
 
 bool AcquireRenderView(const cbmath::ParsedView& game, RenderView& out) {
-    if (!s.frameBegun || !s.shouldRender) return false;
+    if (!s.frameBegun || !s.shouldRender) { ClearWorldPointer(); return false; }
     if (s.poseAcquired) {
         out = s.renderView;
         return true;
@@ -1497,7 +1994,7 @@ bool AcquireRenderView(const cbmath::ParsedView& game, RenderView& out) {
 
     if (XR_FAILED(g.xrLocateSpace(s.viewSpace, s.localSpace, s.displayTime, &head)) ||
         !(head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
-        return false;
+        { ClearWorldPointer(); return false; }
     UpdateGaze();
 
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
@@ -1507,7 +2004,7 @@ bool AcquireRenderView(const cbmath::ParsedView& game, RenderView& out) {
     XrViewState vs{XR_TYPE_VIEW_STATE};
     uint32_t n = 0;
     if (XR_FAILED(g.xrLocateViews(s.session, &li, &vs, 2, &n, views)) || n != 2 ||
-        !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+        !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) { ClearWorldPointer(); return false; }
 
     s.headPose = head.pose;
     s.headPositionValid = (head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
@@ -1571,6 +2068,7 @@ bool AcquireRenderView(const cbmath::ParsedView& game, RenderView& out) {
     const cbmath::Vec3 up = ToGame(Rotate(q, {0, 1, 0}));
     const cbmath::Vec3 fwd = ToGame(Rotate(q, {0, 0, -1}));
     if (s.recenterPending || g_recenterRequest.exchange(false)) {
+        s.alternate.Reset();
         s.headYaw0 = YawOf(fwd);
         s.headPos0 = head.pose.position;
         s.recenterPending = false;
@@ -2045,6 +2543,41 @@ bool AcquireRenderView(const cbmath::ParsedView& game, RenderView& out) {
     s.renderView.fov = {std::tan(s.fovUnion.angleLeft), std::tan(s.fovUnion.angleRight), std::tan(s.fovUnion.angleUp),
                         std::tan(s.fovUnion.angleDown)};
     s.parkDepth = parkDepth;
+    const auto now = GetTickCount64();
+    const bool inPark = gamestate::InPark();
+    const auto rideMode = gamestate::RideCamera();
+    const bool locked = gamestate::CameraModeLocks() > 0;
+    const bool canHold = s.handoffSourceFrame != UINT64_MAX && s.handoffSourceFrame + 1 == s.frames &&
+        s.eyeTex[0] && s.eyeTex[1];
+    const auto handoff = s.cameraHandoff.Update(now, s.cameraControl && s.stereo && s.engineView && inPark,
+        menu::PauseVisible(), locked, rideMode, shownDriven && !ride && !locked, ride, canHold);
+    s.handoffFade = handoff.fade;
+    s.handoffHolding = handoff.hold;
+    if (s.worldLaser) {
+        s.worldPointer={};
+        const auto& hand=s.motionFrame.hand[1];
+        // A tracked rider can use the native camera menu on the hand without
+        // publishing a park pick ray into the game's ride-camera input context.
+        s.handUiEligible=s.engineView && s.stereo && (shownDriven || ride) && s.headPositionValid &&
+            inPark && s.sessionState==XR_SESSION_STATE_FOCUSED && hand.active && hand.aimValid;
+        s.handUiTime=now;
+        // World selection belongs to the tracked park camera. Menus, cutscenes,
+        // ride views and position-invalid tracking cannot acquire this override.
+        s.worldEligible=s.engineView && s.stereo && shownDriven && !ride && parkDepth && s.headPositionValid &&
+            inPark && rideMode==gamestate::Ride::None &&
+            s.sessionState==XR_SESSION_STATE_FOCUSED && hand.active && hand.aimValid;
+        if (s.worldEligible && s.laserInput.enabled) {
+            const auto ray=pointer::AimRay(hand.aim);
+            const float scale=s.worldScale*(s.zoomDepth && parkDepth ? s.zoomScale : 1.f);
+            const pointer::world::Frame frame{ray,pointer::ToWorld(ray,head.pose.position,s.submitPose.orientation,game,scale),
+                s.gameWindow,GetTickCount64(),true,scale,pointer::Space(head.pose.position,s.submitPose.orientation,game,scale),
+                {game.pos,game.basis.forward}};
+            if (pointer::world::Publish(frame)) {
+                s.worldPointer=frame;
+            }
+        }
+        if (!s.worldPointer.valid) pointer::world::Clear();
+    }
     s.poseAcquired = true;
     out = s.renderView;
     return true;
@@ -2138,6 +2671,26 @@ void SetStereo(bool on, float worldScale) {
 
 bool StereoEnabled() { return s.stereo && s.engineView; }
 
+void RequestStereoMode(StereoMode mode) {
+    g_stereoModeRequest.store(static_cast<int>(mode),std::memory_order_relaxed);
+}
+
+bool FrameWarpEnabled() { return s.stereoMode == StereoMode::AFW; }
+bool HoldingCameraHandoff() { return s.handoffHolding; }
+
+bool AlternateScene() {
+    return s.stereoMode != StereoMode::TrueStereo && s.frameBegun && s.shouldRender && s.poseAcquired &&
+        s.headPositionValid && s.shownDriven && !menu::PauseVisible();
+}
+
+int AlternateEyeForFrame() {
+    if (!AlternateScene() || s.alternateParkDepth != s.parkDepth) {
+        s.alternate.Reset();
+        afw::InvalidateHistory();
+    }
+    return s.alternate.Select(s.frames);
+}
+
 bool StereoEyesForFrame(float local[2][3], float& worldScale, float tanFov[2][4], bool& perEye) {
     if (!s.stereo || !s.engineView || !s.poseAcquired) return false;
     memcpy(local, s.eyeWorld, sizeof(s.eyeWorld));
@@ -2177,6 +2730,9 @@ bool InitCapture(ID3D12CommandQueue* queue, const D3D12_RESOURCE_DESC& bb) {
         }
     }
     if (s.eyeTex[0] && bb.Width == s.eyeW && bb.Height == s.eyeH && bb.Format == s.eyeFormat) return true;
+    s.alternate.Reset();
+    afw::InvalidateHistory();
+    s.eyeMarkers[0] = s.eyeMarkers[1] = nullptr;
     // New size or format: no blit may still read the old textures.
     if (s.fence && s.lastBlitValue && s.fence->GetCompletedValue() < s.lastBlitValue) {
         s.fence->SetEventOnCompletion(s.lastBlitValue, s.copyEvent);
@@ -2203,13 +2759,15 @@ bool InitCapture(ID3D12CommandQueue* queue, const D3D12_RESOURCE_DESC& bb) {
 }
 }  // namespace
 
-bool CaptureEye(int eye, ID3D12CommandQueue* queue, ID3D12Resource* image) {
+bool CaptureEye(int eye, ID3D12CommandQueue* queue, ID3D12Resource* image, bool first, const afw::Frame* warp,
+                ID3D12Resource* markers) {
     if (!image || eye < 0 || eye > 1) return false;
+    if (first) s.warpedEye = nullptr;
     // The image the batch rendered (COMMON at the batch's end; a back buffer would be
     // PRESENT, the same value).
     ID3D12Resource* bb = image;
     if (!InitCapture(queue, bb->GetDesc())) return false;
-    if (eye == 0) {
+    if (first) {
         s.copyRing = (s.copyRing + 1) % State::kRing;
         // GPU-side: the headset blit of an earlier frame may still be reading eyeTex.
         if (s.fence && s.lastBlitValue) queue->Wait(s.fence.Get(), s.lastBlitValue);
@@ -2234,11 +2792,26 @@ bool CaptureEye(int eye, ID3D12CommandQueue* queue, ID3D12Resource* image) {
     list->CopyResource(s.eyeTex[eye].Get(), bb);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
-    list->Close();
+    if (warp && FrameWarpEnabled() && (!markers || s.eyeMarkers[eye^1])) {
+        const bool idle = s.copyFence->GetCompletedValue() >= s.copyValue &&
+            (!s.fence || s.fence->GetCompletedValue() >= s.lastBlitValue);
+        if (afw::Prepare(s.captureDevice.Get(),bb->GetDesc(),*warp,idle)) {
+            s.warpedEye = afw::Record(list,static_cast<unsigned>(s.copyRing*2+eye),eye,s.frames,
+                                     *warp,s.eyeTex[eye].Get(),s.eyeTex[eye^1].Get(),s.eyeFormat);
+            s.warpedFrame = s.frames;
+        }
+    }
+    if (!s.warpedEye) afw::InvalidateHistory();
+    if (FAILED(list->Close())) {
+        s.warpedEye = nullptr;
+        afw::InvalidateHistory();
+        return false;
+    }
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     s.copySlotValue[s.copyRing][eye] = ++s.copyValue;
     queue->Signal(s.copyFence.Get(), s.copyValue);
+    s.eyeMarkers[eye] = markers;
     return true;
 }
 
@@ -2276,6 +2849,11 @@ void WaitPanelFree(ID3D12CommandQueue* queue) {
     if (s.fence && s.lastBlitValue) queue->Wait(s.fence.Get(), s.lastBlitValue);
 }
 
+void WaitMarkersFree(ID3D12CommandQueue* queue) {
+    if (s.fence && s.fence->GetCompletedValue() < s.lastMarkerBlitValue)
+        queue->Wait(s.fence.Get(), s.lastMarkerBlitValue);
+}
+
 void PanelCaptured(ID3D12CommandQueue* queue, ID3D12Resource* image, uint32_t w, uint32_t h) {
     if (!s.copyFence) return;  // PanelPixels gave no size without it
     s.panelValue = ++s.copyValue;
@@ -2289,7 +2867,30 @@ void PanelCaptured(ID3D12CommandQueue* queue, ID3D12Resource* image, uint32_t w,
 void EyesCaptured(ID3D12CommandQueue*) {
     s.eyesValue = s.copyValue;
     s.eyesCaptured = true;
+    if (s.shownDriven) {
+        for (int eye=0;eye<2;++eye) {
+            const auto out=EyeOutputFor(eye,true);
+            s.capturedEyeOrientation[eye]=out.pose.orientation;
+            s.capturedEyeFov[eye]=out.fov;
+        }
+    }
+    if (AlternateScene()) {
+        s.alternateParkDepth=s.parkDepth;
+        s.alternatePanel=s.panelCaptured;
+        s.alternate.Seed(s.frames);
+    }
+}
 
+void AlternateEyeCaptured(int eye) {
+    if (s.alternatePanel!=s.panelCaptured || !s.alternate.Capture(s.frames,eye)) {
+        s.alternate.Reset();
+        return;
+    }
+    const auto out=EyeOutputFor(eye,true);
+    s.capturedEyeOrientation[eye]=out.pose.orientation;
+    s.capturedEyeFov[eye]=out.fov;
+    s.eyesValue=s.copyValue;
+    s.eyesCaptured=true;
 }
 
 // ---- the game's finished frame image ----
@@ -2373,6 +2974,9 @@ ID3D12Resource* BatchFrameImage(uint32_t count, ID3D12CommandList* const* lists,
 }
 
 void OnResizeBuffers() {
+    // Resize can originate outside the render thread. Invalidate only the
+    // synchronized native snapshot here; Present resets its own visual state.
+    if (s.worldLaser) pointer::world::Clear();
     for (auto& b : g_backBuffers) b.store(nullptr);
     s.gameSwapRaw = nullptr;  // re-read the buffers at the next Present
     std::lock_guard<std::mutex> lock(g_frameImageMutex);

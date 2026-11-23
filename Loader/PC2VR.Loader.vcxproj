@@ -35,14 +35,22 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\ThirdParty\OpenXR\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)ui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <ModuleDefinitionFile>$(ProjectDir)src\version.def</ModuleDefinitionFile>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d12.lib;d3dcompiler.lib;xmllite.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;d3dcompiler.lib;xmllite.lib;ole32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(MotionInputTrace)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>PC2VR_MOTION_INPUT_TRACE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
@@ -57,16 +65,26 @@
     <ClCompile Include="src\xr_runtime.cpp" />
     <ClCompile Include="src\camera_control.cpp" />
     <ClCompile Include="src\input_hook.cpp" />
+    <ClCompile Include="src\motion_controls.cpp" />
+    <ClCompile Include="src\window_pointer.cpp" />
+    <ClCompile Include="src\menu_pointer.cpp" />
+    <ClCompile Include="src\native_input_hook.cpp" />
+    <ClCompile Include="src\native_mouse_sources.cpp" />
+    <ClCompile Include="src\world_pointer.cpp" />
+    <ClCompile Include="src\world_click.cpp" />
     <ClCompile Include="src\inline_hook.cpp" />
     <ClCompile Include="src\stereo.cpp" />
     <ClCompile Include="src\config_redirect.cpp" />
     <ClCompile Include="src\control_settings.cpp" />
     <ClCompile Include="src\depth_probe.cpp" />
+    <ClCompile Include="src\afw_inputs.cpp" />
+    <ClCompile Include="src\afw_warp.cpp" />
     <ClCompile Include="src\vrs.cpp" />
     <ClCompile Include="src\rtv_registry.cpp" />
     <ClCompile Include="src\highlight_mask.cpp" />
     <ClCompile Include="src\ui_layer.cpp" />
     <ClCompile Include="src\ride_camera.cpp" />
+    <ClCompile Include="src\ride_visibility.cpp" />
     <ClCompile Include="src\game_props.cpp" />
     <ClCompile Include="src\game_state.cpp" />
   </ItemGroup>
@@ -74,6 +92,10 @@
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\control_settings.h" />
     <ClInclude Include="src\depth_probe.h" />
+    <ClInclude Include="src\afw_inputs.h" />
+    <ClInclude Include="src\afw_warp.h" />
+    <ClInclude Include="src\afw_shader.h" />
+    <ClInclude Include="src\stereo_mode.h" />
     <ClInclude Include="src\vrs.h" />
     <ClInclude Include="src\rtv_registry.h" />
     <ClInclude Include="src\highlight_mask.h" />
@@ -86,6 +108,7 @@
     <ClInclude Include="src\ride_camera.h" />
     <ClInclude Include="src\game_props.h" />
     <ClInclude Include="src\game_state.h" />
+    <ClInclude Include="src\camera_handoff.h" />
     <ClInclude Include="src\d3d12_hooks.h" />
     <ClInclude Include="src\upload_registry.h" />
     <ClInclude Include="src\upload_table.h" />
@@ -96,14 +119,42 @@
     <ClInclude Include="src\xr_runtime.h" />
     <ClInclude Include="src\camera_control.h" />
     <ClInclude Include="src\input_hook.h" />
+    <ClInclude Include="src\motion_controls.h" />
+    <ClInclude Include="src\motion_pad.h" />
+    <ClInclude Include="src\pointer_geometry.h" />
+    <ClInclude Include="src\world_pointer_geometry.h" />
+    <ClInclude Include="src\world_pointer.h" />
+    <ClInclude Include="src\world_click.h" />
+    <ClInclude Include="src\laser_controls.h" />
+    <ClInclude Include="src\selection_panel.h" />
+    <ClInclude Include="src\ride_panel.h" />
+    <ClInclude Include="src\ride_panel_state.h" />
+    <ClInclude Include="src\ride_panel_geometry.h" />
+    <ClInclude Include="src\ride_panel_bridge.h" />
+    <ClInclude Include="src\build_panel_bridge.h" />
+    <ClInclude Include="src\notification_bridge.h" />
+    <ClInclude Include="src\ride_popup_bridge.h" />
+    <ClInclude Include="src\ride_click_broker.h" />
+    <ClInclude Include="src\selection_panel_state.h" />
+    <ClInclude Include="src\info_panel_bridge.h" />
+    <ClInclude Include="src\motion_trace.h" />
+    <ClInclude Include="src\mouse_events.h" />
+    <ClInclude Include="src\pointer_packets.h" />
+    <ClInclude Include="src\pointer_device.h" />
+    <ClInclude Include="src\window_pointer.h" />
+    <ClInclude Include="src\menu_pointer.h" />
+    <ClInclude Include="src\alternate_eyes.h" />
+    <ClInclude Include="src\native_input_hook.h" />
+    <ClInclude Include="src\native_mouse_sources.h" />
     <ClInclude Include="src\inline_hook.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="src\version.def" />
+    <ClInclude Include="src\embedded_assets.h" />
+    <ResourceCompile Include="ui\embedded_assets.rc" />
   </ItemGroup>
   <Target Name="CopyOpenXrLoader" AfterTargets="Build">
     <Copy SourceFiles="$(ProjectDir)..\ThirdParty\OpenXR\openxr_loader.dll" DestinationFolder="$(OutDir)PC2VR\" />
-    <Copy SourceFiles="$(ProjectDir)ui\VRMenu.js" DestinationFolder="$(OutDir)PC2VR\" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

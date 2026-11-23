@@ -1,6 +1,7 @@
 #include "highlight_mask.h"
 #include "highlight_signature.h"
 #include "rtv_registry.h"
+#include "afw_inputs.h"
 
 #include <array>
 #include <atomic>
@@ -55,6 +56,7 @@ template<typename T> bool Skip(const uint8_t* p, size_t size, size_t& offset) {
 void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_relaxed); }
 
 void OnPipelineCreated(ID3D12PipelineState* pipeline, const D3D12_SHADER_BYTECODE& shader) {
+    afw::MarkVelocityPipeline(pipeline, shader);
     if (!pipeline || !IsMaskShader(shader.pShaderBytecode, shader.BytecodeLength)) return;
     constexpr BOOL mask = TRUE;
     pipeline->SetPrivateData(kMaskPipeline, sizeof(mask), &mask);

@@ -16,6 +16,7 @@
 #include "log.h"
 #include "rtv_registry.h"
 #include "xr_runtime.h"
+#include "vr_menu.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -50,10 +51,17 @@ void ReadSettings() {
     p.horizontalDeg = std::clamp(static_cast<float>(static_cast<int>(GetPrivateProfileIntW(L"UI", L"PanelHorizontalDeg", 0, g_ini))), -60.f, 60.f);
     p.followHmd = GetPrivateProfileIntW(L"UI", L"FollowHmd", 0, g_ini) != 0;
     p.markers3d = GetPrivateProfileIntW(L"UI", L"MarkersIn3D", 1, g_ini) != 0;
+    p.ridePanel = GetPrivateProfileIntW(L"UI", L"RidePanel", 1, g_ini) != 0;
+    p.buildWheel = GetPrivateProfileIntW(L"UI", L"BuildWheel", 1, g_ini) != 0;
+    p.dashboard = GetPrivateProfileIntW(L"UI", L"WristDashboard", 1, g_ini) != 0;
+    p.rideWidthM = std::clamp(GetPrivateProfileIntW(L"UI", L"RidePanelWidthCm", 18, g_ini),18u,60u)*.01f;
+    bool buildChanged=false;
     {
         std::lock_guard<std::mutex> lock(g_settingsMutex);
+        buildChanged=g_settings.on!=p.on || g_settings.buildWheel!=p.buildWheel || g_settings.dashboard!=p.dashboard;
         g_settings = p;
     }
+    if(buildChanged)menu::BuildConfigurationChanged();
     LOG("ui: panel %s, %.0f deg wide, %.2f m away, centre %+.0f deg; world markers %s", p.on ? "on" : "off (UI drawn into the 3D image)",
         p.widthDeg, p.distanceM, p.heightDeg, p.markers3d ? "in the 3D view" : "on the panel");
 }
@@ -311,8 +319,13 @@ PanelSettings Settings() {
 }
 
 void ApplySettings(const PanelSettings& settings) {
-    std::lock_guard<std::mutex> lock(g_settingsMutex);
-    g_settings=settings;
+    bool buildChanged=false;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        buildChanged=g_settings.on!=settings.on || g_settings.buildWheel!=settings.buildWheel || g_settings.dashboard!=settings.dashboard;
+        g_settings=settings;
+    }
+    if(buildChanged)menu::BuildConfigurationChanged();
 }
 
 // ---------------------------------------------------------------- batch --
@@ -419,20 +432,21 @@ void EnsureUiRtv(ID3D12Resource* ui) {
 // their own, which a compute pass then writes into the UI layer, before the list that
 // composites the HUD over it. With the whole UI layer on the panel, they floated with
 // it, away from the ground they mark (reported in the headset 2026-10-04).
-void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
+void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute, bool first) {
     if (!g_plan.valid || g_plan.hudIndex < 0 || eye < 0 || eye > 1 || !InitGpu(queue)) return;
     ID3D12Resource* ui = g.ui.Get();
     if (!ui || !EnsureMarkers(eye, ui)) return;
     EnsureUiRtv(ui);
-    if (eye == 0) g.markerSlot = (g.markerSlot + 1) % kRing;
+    if (first) g.markerSlot = (g.markerSlot + 1) % kRing;
     const int slot = g.markerSlot;
     if (g.fence->GetCompletedValue() < g.markerSlotValue[slot][eye]) return;  // not saved: Separate clears as before
     // Only when Separate will put them back: its slot is free and (first eye) the panel
     // has a size. Otherwise nothing is taken out and the frame goes as before.
-    const int sepSlot = eye == 0 ? (g.slot + 1) % kRing : g.slot;
+    const int sepSlot = first ? (g.slot + 1) % kRing : g.slot;
     uint32_t pw = 0, ph = 0;
-    if (eye == 0) xr::PanelPixels(Settings().widthDeg, g_plan.srcW, g_plan.srcH, pw, ph);
-    if (g.fence->GetCompletedValue() < g.slotValue[sepSlot][eye] || (eye == 0 && (!pw || !ph))) return;
+    if (first) xr::PanelPixels(Settings().widthDeg, g_plan.srcW, g_plan.srcH, pw, ph);
+    if (g.fence->GetCompletedValue() < g.slotValue[sepSlot][eye] || (first && (!pw || !ph))) return;
+    if (first) xr::WaitMarkersFree(queue);
     ID3D12GraphicsCommandList* l = g.markerList[eye].Get();
     g.markerAlloc[slot][eye]->Reset();
     l->Reset(g.markerAlloc[slot][eye].Get(), nullptr);
@@ -442,7 +456,6 @@ void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
     ID3D12Resource* m = g.markers[eye].Get();
     Transition(l, ui, s, D3D12_RESOURCE_STATE_COPY_SOURCE);
     l->CopyResource(m, ui);
-    Transition(l, m, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(l, ui, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float zero[4] = {0.f, 0.f, 0.f, 0.f};
     l->ClearRenderTargetView(Rtv(1), zero, 0, nullptr);
@@ -455,11 +468,11 @@ void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
     g.markersSaved[eye] = true;
 }
 
-void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
-    if (!g_plan.valid || eye < 0 || eye > 1 || !InitGpu(queue)) return;
+ID3D12Resource* Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute, bool first, bool keepMarkers) {
+    if (!g_plan.valid || eye < 0 || eye > 1 || !InitGpu(queue)) return nullptr;
     ID3D12Resource* ui = g.ui.Get();
     EnsureUiRtv(ui);
-    if (eye == 0) g.slot = (g.slot + 1) % kRing;
+    if (first) g.slot = (g.slot + 1) % kRing;
     // Recycle this slot's allocator (used kRing frames ago; normally long finished).
     const uint64_t slotValue = g.slotValue[g.slot][eye];
     for (int tries = 0; g.fence->GetCompletedValue() < slotValue && tries < 20; ++tries) {
@@ -469,7 +482,7 @@ void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
     if (g.fence->GetCompletedValue() < slotValue) {
         // Never clear without capturing: leave this frame's UI in the image.
         g_plan.valid = false;
-        return;
+        return nullptr;
     }
     const D3D12_RESOURCE_STATES s = g_plan.state;
     ID3D12GraphicsCommandList* l = g.list[eye].Get();
@@ -477,7 +490,7 @@ void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
     l->Reset(g.alloc[g.slot][eye].Get(), nullptr);
     D3D12_RESOURCE_STATES cur = s;
     bool panelDone = false;
-    if (eye == 0) {
+    if (first) {
         // Panel image size: the panel's angular width at the headset's pixel density.
         uint32_t pw = 0, ph = 0;
         xr::PanelPixels(Settings().widthDeg, g_plan.srcW, g_plan.srcH, pw, ph);
@@ -522,19 +535,19 @@ void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
             // No panel this frame: keep the UI in the image (both eyes).
             l->Close();
             g_plan.valid = false;
-            return;
+            return nullptr;
         }
     }
-    if (g.markersSaved[eye]) {
+    ID3D12Resource* saved = g.markersSaved[eye] ? g.markers[eye].Get() : nullptr;
+    if (saved && !keepMarkers) {
         // The HUD is on the panel; the UI layer gets the world markers back, so the
         // display mapper draws them into this eye's 3D image (each eye's own markers,
         // rendered with that eye's camera).
-        ID3D12Resource* m = g.markers[eye].Get();
+        Transition(l, saved, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(l, ui, cur, D3D12_RESOURCE_STATE_COPY_DEST);
-        l->CopyResource(ui, m);
+        l->CopyResource(ui, saved);
         Transition(l, ui, D3D12_RESOURCE_STATE_COPY_DEST, s);
-        Transition(l, m, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.markersSaved[eye] = false;
+        Transition(l, saved, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     } else {
         // Clear the UI layer: the display mapper then outputs the 3D scene alone.
         Transition(l, ui, cur, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -542,12 +555,14 @@ void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute) {
         l->ClearRenderTargetView(Rtv(1), zero, 0, nullptr);
         Transition(l, ui, D3D12_RESOURCE_STATE_RENDER_TARGET, s);
     }
+    g.markersSaved[eye] = false;
     l->Close();
     ID3D12CommandList* run[] = {l};
     execute(queue, 1, run);
     g.slotValue[g.slot][eye] = ++g.fenceValue;
     queue->Signal(g.fence.Get(), g.fenceValue);
-    if (eye == 0) xr::PanelCaptured(queue, g.panel.Get(), g.panelW, g.panelH);
+    if (first) xr::PanelCaptured(queue, g.panel.Get(), g.panelW, g.panelH);
+    return keepMarkers ? saved : nullptr;
 }
 
 void FinishBatch(uint32_t count, ID3D12CommandList* const* lists) {

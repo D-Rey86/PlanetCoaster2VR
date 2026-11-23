@@ -25,11 +25,12 @@ if ($Remove) {
     return
 }
 
-foreach ($file in 'version.dll', 'PC2VR\openxr_loader.dll', 'PC2VR\VRMenu.js') {
+foreach ($file in 'version.dll', 'PC2VR\openxr_loader.dll') {
     if (-not (Test-Path -LiteralPath "$root\Builds\$file")) { throw "Build output missing: $file. Build the current branch first." }
 }
 New-Item -ItemType Directory -Force "$GameDir\PC2VR" | Out-Null
 Copy-Item "$root\Builds\version.dll" $dst -Force
 Copy-Item "$root\Builds\PC2VR\openxr_loader.dll" "$GameDir\PC2VR\" -Force
-Copy-Item "$root\Builds\PC2VR\VRMenu.js" "$GameDir\PC2VR\" -Force
-Get-Item $dst, "$GameDir\PC2VR\openxr_loader.dll", "$GameDir\PC2VR\VRMenu.js" | Select-Object FullName, Length, LastWriteTime
+# Menu code is embedded in version.dll; retire the legacy loose copy.
+Remove-Item -LiteralPath "$GameDir\PC2VR\VRMenu.js" -ErrorAction SilentlyContinue
+Get-Item $dst, "$GameDir\PC2VR\openxr_loader.dll" | Select-Object FullName, Length, LastWriteTime

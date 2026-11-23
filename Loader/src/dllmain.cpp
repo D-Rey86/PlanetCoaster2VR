@@ -19,6 +19,10 @@
 #include "xr_runtime.h"
 #include "log.h"
 #include "vr_menu.h"
+#include "world_pointer.h"
+#include "world_click.h"
+#include "menu_pointer.h"
+#include "ride_camera.h"
 
 namespace {
 
@@ -137,6 +141,13 @@ DWORD WINAPI InitThread(LPVOID) {
 
     // XR=0 runs the hooks without starting OpenXR (no headset needed).
     const bool xr = ReadIniInt(L"Loader", L"XR", 1) != 0;
+    const bool motion = xr && ReadIniInt(L"Controls", L"MotionControllers", 0) == 1;
+    pc2vr::xr::SetMotionControllers(motion);
+    // Isolated world-laser opt-in. Menus retain their native input path.
+    const bool worldLaser=motion && ReadIniInt(L"Experiments",L"WorldLaser",0)==1;
+    pc2vr::xr::SetWorldLaser(worldLaser && pc2vr::pointer::world::Prepare());
+    pc2vr::xr::SetMenuLaser(worldLaser && pc2vr::pointer::menu::Prepare());
+    if (xr) pc2vr::ridecam::Prepare();
     LOG("XR=%d", xr ? 1 : 0);
     pc2vr::highlight::SetEnabled(xr && ReadIniInt(L"Loader", L"Stereo", 0) == 1);
     pc2vr::xr::SetEngineFov(ReadIniInt(L"Loader", L"EngineFov", 1) != 0,
@@ -163,8 +174,14 @@ DWORD WINAPI InitThread(LPVOID) {
                               ReadIniInt(L"Stereo", L"NearestCm", 100) / 100.f);
     pc2vr::xr::SetStereo(ReadIniInt(L"Loader", L"Stereo", 0) == 1,
                          ReadIniInt(L"Stereo", L"WorldScalePercent", 100) / 100.f);
+    pc2vr::xr::RequestStereoMode(pc2vr::xr::ReadStereoMode(ReadIniInt(L"Stereo",L"Mode",-1),
+                                                         ReadIniInt(L"Stereo",L"AlternateEyes",0)));
+    const bool input = xr && ReadIniInt(L"Experiments", L"NoInputHooks", 0) == 0;
+    // Present may create the XR session as soon as the late hooks are installed.
+    // Its immutable controller set needs the bridge ready before that first call.
+    if (input && motion) pc2vr::input::Install(true);
     const bool ok = pc2vr::hooks::InstallLate(xr);
-    if (xr && ReadIniInt(L"Experiments", L"NoInputHooks", 0) == 0) pc2vr::input::Install();
+    if (input && !motion) pc2vr::input::Install();
     LOG("hooks %s", ok ? "installed" : "NOT installed");
     return 0;
 }

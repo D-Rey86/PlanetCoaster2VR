@@ -3,7 +3,7 @@
 import * as preact from '/js/common/lib/preact.js';
 import { OptionsMenuBasePanel } from '/js/project/modules/options/components/OptionsMenuBasePanel.js';
 import { OptionsMenuBasePanelSection } from '/js/project/modules/options/components/OptionsMenuBasePanelSection.js';
-import { OptionsMenuListItemSlider, OptionsMenuListItemOnOffStepper } from '/js/project/modules/options/components/OptionsMenuListItem.js';
+import { OptionsMenuListItemSlider, OptionsMenuListItemOnOffStepper, OptionsMenuListItemListStepper } from '/js/project/modules/options/components/OptionsMenuListItem.js';
 import { Button } from '/js/project/components/Button.js';
 import { stringLiteral } from '/js/common/util/LocalisationUtil.js';
 
@@ -25,7 +25,8 @@ function rpc(path) {
     });
 }
 const defaults = {
-    Resolution: 100, ExpandedCoverage: 0, Foveated: 1, UIWidth: 55, UIDistance: 150, UIHeight: -5, UIHorizontal: 0, UIFollowHmd: 0,
+    Resolution: 100, ExpandedCoverage: 0, StereoMode: 0, Foveated: 1, UIWidth: 55, UIDistance: 150, UIHeight: -5, UIHorizontal: 0, UIFollowHmd: 0,
+    UIRidePanel: 1, UIRideWidth: 18, UIBuildWheel: 1, UIDashboard: 1,
     CheekyEnabled: 0, CheekyWidth: 55, CheekyHeight: 45, CheekyPeripheralDlaa: 1,
     CheekyPeripheralScale: 75, CheekyCenterSupersampling: 100,
     CheekyCenterMode: 0, CheekyRoundness: 0, CheekyTransition: 4,
@@ -184,6 +185,19 @@ export class VRSettingsPanel extends preact.Component {
             onChange: value => this.change(name, value ? 1 : 0, true)
         });
     }
+    stereoMode() {
+        const label = stringLiteral('Rendering mode');
+        return preact.h(OptionsMenuListItemListStepper, {
+            key: 'StereoMode', label, selectedIndex: this.state.values.StereoMode,
+            values: ['True Stereo', 'AER', 'AFW'].map(name => stringLiteral(name)),
+            disabled: !this.state.loaded,
+            optionsMenuInfoData: {
+                infoHeader: label,
+                infoDescription: stringLiteral('True Stereo renders both eyes. AER alternates eyes. AFW reconstructs the other eye and uses AER if reconstruction is unavailable. Applies during play.')
+            },
+            onChange: value => this.change('StereoMode', value, true)
+        });
+    }
     render(props, state) {
         const section = (header, children) => preact.h(OptionsMenuBasePanelSection, { header: stringLiteral(header), panelIndex: props.panelIndex }, children);
         return preact.h(OptionsMenuBasePanel, {
@@ -191,6 +205,7 @@ export class VRSettingsPanel extends preact.Component {
             infoHeader: stringLiteral('VR settings'), infoDescription: stringLiteral('Changes save automatically. DLSS users: model E is recommended through your game-specific driver profile.')
         },
         section('Resolution (' + state.renderSize + ')', [
+            this.stereoMode(),
             this.toggle('ExpandedCoverage', 'Expanded headset coverage', 'Off uses the original FOV and rendering behavior. On improves edge coverage for wide or angled displays and head tilt, but can increase rendering cost. Applies during play.'),
             this.slider('Resolution', 'VR render resolution', 25, 200, 5, '%',
                 'Scales the headset-recommended pixel density while preserving its field of view. Lower values improve performance; higher values improve detail.'),
@@ -198,6 +213,10 @@ export class VRSettingsPanel extends preact.Component {
         ]),
         section('UI placement', [
             this.toggle('UIFollowHmd', 'Follow headset', 'Off keeps the current recentered placement. On moves the HUD and its selection circle with your headset. Fixed menus keep their picture and UI together.'),
+            this.toggle('UIRidePanel', 'Left-hand object panels', 'Selected park objects and rider controls appear on your left controller. Point the right laser and press A to use them.'),
+            this.toggle('UIBuildWheel', 'Controller build wheel', 'Tap the left grip to open the build wheel beside your left hand. Point with the right laser and press A. B goes back. The catalog clears when placement begins.'),
+            this.slider('UIRideWidth', 'Object panel width', 18, 60, 1, ' cm', 'Width of the object and rider panels on your left controller.'),
+            this.toggle('UIDashboard', 'Wrist dashboard and notifications', 'Park info and the notification inbox appear below the LB build wheel. Brief alerts appear above the left controller while park controls are clear. Point the right laser and press A.'),
             this.slider('UIWidth', 'UI width', 20, 120, 1, ' deg', 'Angular width of the HUD and pause-menu panel.'),
             this.slider('UIDistance', 'UI distance', 30, 1000, 10, ' cm', 'Distance of the HUD and pause-menu panel. This changes its stereo depth.'),
             this.slider('UIHorizontal', 'UI horizontal position', -60, 60, 1, ' deg', 'Moves the HUD to the left or right. Positive values move it right.'),

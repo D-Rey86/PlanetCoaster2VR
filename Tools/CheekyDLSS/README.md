@@ -36,5 +36,5 @@ child process. Steam and the selected physical VR runtime/headset must already b
 ready. Package it beside the game executable or supply `-GameDirectory`;the source
 checkout can also discover the Steam installation. It does not start SteamVR,
 switch the runtime,stop/restart the game or reset settings. Use the freshly built
-core loader and VRMenu.js from the same source snapshot,not an old accepted build.
+core loader with its embedded VR menu from the same source snapshot,not an old accepted build.
 Preserve user INIs on updates. Packaging does not deploy or launch anything.

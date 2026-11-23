@@ -203,8 +203,13 @@ namespace {
 // its surfaces are composited into the UI layer through an sRGB view. No scene pass
 // binds an R8G8B8A8_UNORM target together with depth; the one scene-size pass through
 // an sRGB view is a single full-screen quad.
-bool IsUiPass(const rtvreg::Info& rt0, bool hasDepth) {
+bool NeedsFullRate(const rtvreg::Info& rt0, bool hasDepth) {
     switch (rt0.format) {
+        // The visibility buffer and packed G-buffer use R32_UINT as their
+        // first target. These values feed later shading and must retain their
+        // pixel layout. Coarse shading here produced blue ground streaks in
+        // the live park, even when the final color passes were unchanged.
+        case DXGI_FORMAT_R32_UINT:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
             return true;
@@ -222,7 +227,7 @@ void OnSetRenderTargets(ID3D12GraphicsCommandList* list, const rtvreg::Info* rt0
     bool scene = false;
     if (image && rt0)
         scene = rt0->width == g_sceneW.load(std::memory_order_relaxed) && rt0->height == g_sceneH.load(std::memory_order_relaxed) &&
-                !IsUiPass(*rt0, hasDepth);
+                !NeedsFullRate(*rt0, hasDepth);
     ID3D12GraphicsCommandList5* l5 = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_listMutex);

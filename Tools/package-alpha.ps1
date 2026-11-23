@@ -17,16 +17,16 @@ function GitChecked([string[]]$GitArguments) {
 $commit=(GitChecked @('rev-parse',($Ref+'^{commit}'))).Trim()
 $files=@(GitChecked @('ls-tree','-r','--name-only',$commit))
 $publicFiles=@($files | Where-Object {
-    $_ -in @('.gitignore','.gitattributes','README.md','LICENSE','THIRD_PARTY.md','RELEASE_PREP.md') -or
-    $_ -match '^Loader/(src/[^/]+\.(cpp|h|hpp|def)|ui/VRMenu\.js|PC2VR\.Loader\.vcxproj|pc2vr\.ini\.example)$' -or
+    $_ -in @('.gitignore','.gitattributes','README.md','CHANGELOG.md','LICENSE','THIRD_PARTY.md','RELEASE_PREP.md') -or
+    $_ -match '^Loader/(src/[^/]+\.(cpp|h|hpp|def)|ui/(VRMenu\.js|embedded_assets\.rc)|PC2VR\.Loader\.vcxproj|pc2vr\.ini\.example)$' -or
     $_ -match '^ThirdParty/OpenXR/(LICENSE\.txt|README\.md|SOURCE\.json|openxr_loader\.dll|include/openxr/[^/]+\.(h|txt))$' -or
     $_ -in @('Tools/package-alpha.ps1','Tools/sanitize-pdb-paths.ps1','Tools/deploy.ps1','Tools/gamedir.ps1') -or
     $_ -match '^Tools/CheekyDLSS/(README\.md|LICENSE\.upstream\.txt|pc2-cheeky-compatibility\.patch|CheekyFoveatedDLSS\.ini\.example|build\.ps1|package\.ps1|launch\.ps1)$' -or
-    $_ -match '^Tools/test/(control_settings_test|upload_read_test|upload_registry_test|frustum_bounds_test|coverage_policy_test|vr_menu_test|vrs_capability_test|game_state_test)\.(cpp|vcxproj)$' -or
-    $_ -in @('Tools/test/vr_menu_frontend_test.cjs','Tools/test/launcher_test.ps1')
+    $_ -match '^Tools/test/[a-z_]+_test\.(cpp|vcxproj|cjs)$' -or
+    $_ -eq 'Tools/test/launcher_test.ps1'
 })
 foreach($required in @('LICENSE','README.md','THIRD_PARTY.md','RELEASE_PREP.md',
-    'Loader/PC2VR.Loader.vcxproj','Loader/ui/VRMenu.js','Loader/pc2vr.ini.example',
+    'Loader/PC2VR.Loader.vcxproj','Loader/ui/VRMenu.js','Loader/ui/embedded_assets.rc','Loader/src/embedded_assets.h','Loader/pc2vr.ini.example',
     'ThirdParty/OpenXR/SOURCE.json','ThirdParty/OpenXR/openxr_loader.dll')) {
     if($required -eq 'LICENSE' -and $DraftWithoutLicense){continue}
     if($publicFiles -notcontains $required){throw "Required committed public input missing: $required. Select/commit the mod license before packaging."}
@@ -82,7 +82,7 @@ foreach($file in Get-ChildItem -LiteralPath $dependency -File -Recurse) {
     New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
     Copy-Item -LiteralPath $file.FullName -Destination $target
 }
-$coreFiles=@('version.dll','PC2VR\openxr_loader.dll','PC2VR\VRMenu.js')
+$coreFiles=@('version.dll','PC2VR\openxr_loader.dll')
 foreach($file in $coreFiles) {Copy-Item -LiteralPath (Join-Path $build $file) -Destination (Join-Path $package $file)}
 foreach($file in @('version.dll','dxgi.dll',
     'CheekyFoveatedDLSS\CheekyFoveatedDLSSHost.dll',
@@ -95,10 +95,10 @@ foreach($file in @('version.dll','dxgi.dll',
         throw "Private build detail found in release binary: $file"
     }
 }
-if((Get-FileHash -LiteralPath (Join-Path $package 'PC2VR\VRMenu.js')).Hash -ne
-    (Get-FileHash -LiteralPath (Join-Path $publicRoot 'Loader\ui\VRMenu.js')).Hash){throw 'Built menu differs from committed source.'}
+# The UI source and resource definition travel in the corresponding-source ZIP;
+# the game needs only the copy compiled into version.dll.
 Copy-Item -LiteralPath (Join-Path $publicRoot 'Loader\pc2vr.ini.example') -Destination (Join-Path $package 'PC2VR\pc2vr.ini')
-foreach($file in @('README.md','THIRD_PARTY.md','RELEASE_PREP.md')){Copy-Item -LiteralPath (Join-Path $publicRoot $file) -Destination (Join-Path $package $file)}
+foreach($file in @('README.md','CHANGELOG.md','THIRD_PARTY.md','RELEASE_PREP.md')){Copy-Item -LiteralPath (Join-Path $publicRoot $file) -Destination (Join-Path $package $file)}
 $hasLicense=$publicFiles -contains 'LICENSE'
 if($hasLicense){Copy-Item -LiteralPath (Join-Path $publicRoot 'LICENSE') -Destination (Join-Path $package 'LICENSE')}
 else {
@@ -109,7 +109,12 @@ Copy-Item -LiteralPath (Join-Path $publicRoot 'ThirdParty\OpenXR\LICENSE.txt') -
 Copy-Item -LiteralPath $sourceZip -Destination (Join-Path $package 'source\PC2VR-source.zip')
 Copy-Item -LiteralPath $archive -Destination (Join-Path $package 'source\OpenXR-SDK-Source-1.1.63.zip')
 $ini=Get-Content -LiteralPath (Join-Path $package 'PC2VR\pc2vr.ini') -Raw
-if($ini -notmatch '(?m)^Stereo=1\r?$' -or $ini -match '(?m)^\[Experiments\]'){throw 'Fresh core configuration is not the reviewed stereo template.'}
+foreach($required in @('Stereo=1','Mode=0','MotionControllers=1','WorldLaser=1','BuildWheel=1','RidePanel=1','WristDashboard=1')) {
+    if($ini -notmatch ('(?m)^'+[Regex]::Escape($required)+'\r?$')){throw "Fresh core configuration missing reviewed default: $required"}
+}
+if($ini -match '(?im)^\s*(XrRuntimeJson|XrSimHeadset|XrSimDir|Dred|StereoDump|GpuTiming|MotionInputTrace)\s*='){
+    throw 'Fresh configuration contains private diagnostic settings.'
+}
 $manifest=@(Get-ChildItem -LiteralPath $package -File -Recurse | Sort-Object FullName | ForEach-Object {
     $relative=$_.FullName.Substring($package.Length+1).Replace('\','/')
     if($relative -match '(?i)\.(pdb|ilk|iobj|ipdb|log|dmp|rdc|exe)$' -or

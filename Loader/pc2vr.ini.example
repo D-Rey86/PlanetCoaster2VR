@@ -9,6 +9,10 @@ Stereo=1
 ; 0 selects the mode's default ceiling:130deg original,155deg expanded coverage.
 ; A positive value explicitly overrides either mode; near180deg is unsupported.
 EngineFovMaxDeg=0
+[Stereo]
+; Rendering mode: 0 True Stereo, 1 AER, 2 AFW.
+; Without Mode, an older AlternateEyes=1 setting selects AER.
+Mode=0
 [Resolution]
 ; Percent of headset-recommended pixel density (25-200); menu edits apply live.
 ScalePercent=100
@@ -22,6 +26,15 @@ Foveated=1
 FoveatedInnerDeg=25
 FoveatedMiddleDeg=40
 [UI]
+; Native selection/rider panels and the build catalog follow the left controller.
+RidePanel=1
+RidePanelWidthCm=18
+BuildWheel=1
+; Park statistics/objectives and notification inbox appear below the LB build wheel.
+; Brief alert cards appear above the left controller while park controls are clear.
+; Requires BuildWheel=1; right laser+A selects, right stick scrolls the pointed inbox.
+; 0 restores native status/objective/notification presentation.
+WristDashboard=1
 ; Adds a controller-driven VR tab to the game's existing Settings menu.
 VRMenu=1
 Panel=1
@@ -31,3 +44,10 @@ PanelHeightDeg=-5
 PanelHorizontalDeg=0
 ; 0 = recentered placement, 1 = HUD and selection circle follow the HMD.
 FollowHmd=0
+[Controls]
+MotionControllers=1
+; Quick left stick click = L3; double click within 350 ms or hold 600 ms = Pause.
+; Right A selects with laser, RT zooms; hold right stick click toggles laser.
+[Experiments]
+; Enables the native park/menu laser paths and controller UI availability.
+WorldLaser=1

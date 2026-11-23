@@ -44,6 +44,10 @@ struct PanelSettings {
     float horizontalDeg = 0.f;
     bool followHmd = false;
     bool markers3d = true;     // the game's world markers stay in the 3D view (off: on the panel with the HUD)
+    bool ridePanel = true;
+    bool buildWheel = true;
+    bool dashboard = true;
+    float rideWidthM = .18f;
 };
 PanelSettings Settings();
 // Menu changes publish one complete snapshot; disk persistence is off the render thread.
@@ -59,9 +63,10 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, uint32_t, ID3D12CommandL
 // HUD), or -1. Before it, SaveMarkers takes the markers out of the UI layer; Separate
 // puts them back after the HUD is captured, so they stay in each eye's 3D image.
 int MarkerSplit();
-void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute);
+void SaveMarkers(ID3D12CommandQueue* queue, int eye, ExecuteFn execute, bool first);
 // Between the two parts of eye `eye`'s run.
-void Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute);
+// AFW keeps the saved native overlay out of scene color and composes it after the warp.
+ID3D12Resource* Separate(ID3D12CommandQueue* queue, int eye, ExecuteFn execute, bool first, bool keepMarkers);
 // After both runs: remembers the UI layer's state for the next batch.
 void FinishBatch(uint32_t count, ID3D12CommandList* const* lists);
 

@@ -99,6 +99,24 @@ int main(int argc,char** argv) {
         }
     }
     Require(outer2 && full,"fallback and full-rate regions exercised");Require(!native4x4 || outer4,"normal4x4 region exercised");
+    // Exercise the actual command-list transition from color shading to a
+    // packed-data pass. Leaving the previous image bound corrupts the latter.
+    ComPtr<ID3D12CommandAllocator> targetAllocator;ComPtr<ID3D12GraphicsCommandList> targetList;
+    Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&targetAllocator)),"target allocator");
+    Check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,targetAllocator.Get(),nullptr,IID_PPV_ARGS(&targetList)),"target command list");
+    pc2vr::rtvreg::Info target;target.width=1001;target.height=769;target.format=DXGI_FORMAT_R11G11B10_FLOAT;
+    OnSetRenderTargets(targetList.Get(),&target,true);
+    Require(g_applied[targetList.Get()],"scene color pass receives foveation");
+    target.format=DXGI_FORMAT_R32_UINT;
+    OnSetRenderTargets(targetList.Get(),&target,true);
+    Require(!g_applied[targetList.Get()],"integer data pass restores full-rate shading");
+    target.format=DXGI_FORMAT_R11G11B10_FLOAT;
+    OnSetRenderTargets(targetList.Get(),&target,true);
+    Require(g_applied[targetList.Get()],"color shading resumes after the data pass");
+    target.format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    OnSetRenderTargets(targetList.Get(),&target,true);
+    Require(!g_applied[targetList.Get()],"UI retains full-rate shading");
+    Check(targetList->Close(),"close target command list");
     SetEnabled(false);const auto before=g.fenceValue;PrepareEye(queue.Get(),0,1001,769,frusta[0],centers[0],false);
     Require(g.fenceValue==before,"Off records no additional upload");
     DebugErrors(info.Get());Require(fclose(output)==0,"close test output");

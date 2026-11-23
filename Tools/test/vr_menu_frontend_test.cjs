@@ -5,7 +5,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../../Loade
 const requests = [], intervals = new Map(), timeouts = new Map();
 let actionReply=null, rejectAction=false, rejectState=false;
 let id = 0;
-const server = {ok:true, Resolution:100, ExpandedCoverage:0, Foveated:1, UIWidth:55, UIDistance:150, UIHeight:-5,
+const server = {ok:true, Resolution:100, StereoMode:0, ExpandedCoverage:0, Foveated:1, UIWidth:55, UIDistance:150, UIHeight:-5,
     UIHorizontal:0, UIFollowHmd:0, nvidia:false, cheeky:null, renderWidth:2096, renderHeight:2096};
 class Component {
     constructor(props={}) {this.props=props;this._dirty=1;}
@@ -37,7 +37,7 @@ class XHR {
 const context={preact:{Component,h:(type,props,...children)=>({type,props,children})},
     stringLiteral:value=>`[STRING_LITERAL:Value=|${value}|]`,
     OptionsMenuBasePanel:'panel',OptionsMenuBasePanelSection:'section',
-    OptionsMenuListItemSlider:'slider',OptionsMenuListItemOnOffStepper:'toggle',Button:'button',
+    OptionsMenuListItemSlider:'slider',OptionsMenuListItemOnOffStepper:'toggle',OptionsMenuListItemListStepper:'list',Button:'button',
     XMLHttpRequest:XHR,clearInterval:value=>intervals.delete(value),clearTimeout:value=>timeouts.delete(value),
     setInterval:callback=>{intervals.set(++id,callback);return id;},
     setTimeout:callback=>{timeouts.set(++id,callback);return id;}};
@@ -59,6 +59,14 @@ const settle=async()=>{for(let i=0;i<12;++i)await Promise.resolve();};
     assert.equal(panel.state.available,false,'AMD/missing dependency must disable Cheeky controls');
     const findControl=(node,key)=>node && typeof node==='object' && node.props?.key===key ? node :
         (Array.isArray(node) ? node : node?.children || []).map(child=>findControl(child,key)).find(Boolean);
+    const renderingMode=findControl(panel.render(panel.props,panel.state),'StereoMode');
+    assert.equal(renderingMode.type,'list');
+    assert.deepEqual(Array.from(renderingMode.props.values),['True Stereo','AER','AFW'].map(context.stringLiteral));
+    assert.equal(renderingMode.props.selectedIndex,0);
+    renderingMode.props.onChange(2);await settle();
+    assert.equal(server.StereoMode,2);
+    panel.refresh();await settle();
+    assert.equal(panel.stereoMode().props.selectedIndex,2);
     for(const key of ['CheekyCenterMode','CheekyRoundness','CheekyTransition','CheekyAlignedHeight','CheekyBorder','CheekyGazeSmoothing','CheekyGazeHold']) {
         const control=findControl(panel.render(panel.props,panel.state),key);
         assert.ok(control,`recommended control ${key} exists`);

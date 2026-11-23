@@ -1,6 +1,9 @@
 #pragma once
 
 namespace pc2vr::ridecam {
+// Resolves the native table lookup on the startup worker. Older builds keep
+// the original record discovery path.
+void Prepare();
 
 // The on-ride camera (the ride menu's camera button). Measured 2026-10-03 on a coaster:
 // the game keeps the ride camera's look direction as a (yaw, pitch) pair relative to

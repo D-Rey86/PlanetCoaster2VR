@@ -19,7 +19,8 @@ namespace pc2vr::vrs {
 
 // Command-list hooks (recording time). rt0: the first bound render target (null if none
 // or unknown); hasDepth: a depth-stencil view is bound with it. The game's UI passes are
-// never foveated.
+// never foveated. R32_UINT visibility/packed G-buffer targets also stay at full
+// rate so later shading reads the original per-pixel data.
 void OnSetRenderTargets(ID3D12GraphicsCommandList* list, const rtvreg::Info* rt0, bool hasDepth);
 void OnListReset(ID3D12GraphicsCommandList* list);
 

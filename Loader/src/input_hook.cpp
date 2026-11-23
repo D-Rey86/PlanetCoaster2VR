@@ -16,6 +16,8 @@
 
 #include "inline_hook.h"
 #include "log.h"
+#include "motion_pad.h"
+#include "motion_trace.h"
 
 namespace pc2vr::input {
 namespace {
@@ -27,6 +29,15 @@ std::atomic<float> g_tilt{0.f};  // right stick up = +1 (looks down, like the ga
 std::atomic<ULONGLONG> g_lastHidTurnMs{0};
 
 constexpr float kDeadZone = 0.24f;
+std::mutex g_motionMutex;
+motion::Pad g_motionPad;
+std::atomic<bool> g_motionAvailable{false};
+
+bool MotionState(XINPUT_GAMEPAD& out) {
+    if (!g_motionAvailable.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lock(g_motionMutex);
+    return g_motionPad.Read(GetTickCount64(), out);
+}
 
 float Shape(float f) {
     if (f < -1.f) f = -1.f;
@@ -54,12 +65,33 @@ std::atomic<ULONGLONG> g_userMs[XUSER_MAX_COUNT];
 
 DWORD WINAPI HookGetState(DWORD user, XINPUT_STATE* state) {
     DWORD r = g_xinputOriginal(user, state);
-
+#if defined(PC2VR_MOTION_INPUT_TRACE)
+    const WORD tracePhysical=state && r==ERROR_SUCCESS ? state->Gamepad.wButtons : 0;
+#endif
+    if (state && user < XUSER_MAX_COUNT && r == ERROR_SUCCESS) {
+        // Capture physical input before merging: expired VR input must never remain
+        // in the existing half-second physical-pad cache.
+        g_userTurn[user].store(Shape(state->Gamepad.sThumbRX / 32767.f), std::memory_order_relaxed);
+        g_userTilt[user].store(Shape(state->Gamepad.sThumbRY / 32767.f), std::memory_order_relaxed);
+        g_userMs[user].store(GetTickCount64(), std::memory_order_relaxed);
+    }
+    if (g_motionAvailable.load(std::memory_order_relaxed) && state && user == 0 &&
+        (r == ERROR_SUCCESS || r == ERROR_DEVICE_NOT_CONNECTED)) {
+        std::lock_guard<std::mutex> lock(g_motionMutex);
+        const XINPUT_GAMEPAD physical = r == ERROR_SUCCESS ? state->Gamepad : XINPUT_GAMEPAD{};
+        g_motionPad.Physical(physical);
+        XINPUT_GAMEPAD vr{};
+        if (g_motionPad.Read(GetTickCount64(), vr)) {
+            state->Gamepad = motion::Merge(physical, vr);
+            r = ERROR_SUCCESS;
+        }
+        if (r == ERROR_SUCCESS) state->dwPacketNumber = g_motionPad.Packet(state->Gamepad);
+    }
+#if defined(PC2VR_MOTION_INPUT_TRACE)
+    motiontrace::State(user,r,tracePhysical,state && r==ERROR_SUCCESS ? state->Gamepad.wButtons : 0);
+#endif
     if (r != ERROR_SUCCESS || !state || user >= XUSER_MAX_COUNT) return r;
 
-    g_userTurn[user].store(Shape(state->Gamepad.sThumbRX / 32767.f), std::memory_order_relaxed);
-    g_userTilt[user].store(Shape(state->Gamepad.sThumbRY / 32767.f), std::memory_order_relaxed);
-    g_userMs[user].store(GetTickCount64(), std::memory_order_relaxed);
     if (g_consume.load(std::memory_order_relaxed)) {
         state->Gamepad.sThumbRX = 0;
         state->Gamepad.sThumbRY = 0;
@@ -93,12 +125,78 @@ using GetKeystrokeFn = DWORD(WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
 GetKeystrokeFn g_keystrokeOriginal = nullptr;
 
 DWORD WINAPI HookGetKeystroke(DWORD user, DWORD reserved, PXINPUT_KEYSTROKE ks) {
+    if (g_motionAvailable.load(std::memory_order_relaxed) && ks && !reserved && (user == 0 || user == XUSER_INDEX_ANY)) {
+        std::lock_guard<std::mutex> lock(g_motionMutex);
+        XINPUT_GAMEPAD ignored{}; g_motionPad.Read(GetTickCount64(), ignored);
+        if (g_motionPad.Keystroke(*ks, g_consume.load(std::memory_order_relaxed))) {
+#if defined(PC2VR_MOTION_INPUT_TRACE)
+            motiontrace::Key(true,*ks);
+#endif
+            return ERROR_SUCCESS;
+        }
+    }
     for (;;) {
         const DWORD r = g_keystrokeOriginal(user, reserved, ks);
-        if (r != ERROR_SUCCESS || !ks || !g_consume.load(std::memory_order_relaxed) ||
-            ks->VirtualKey < VK_PAD_RTHUMB_UP || ks->VirtualKey > VK_PAD_RTHUMB_DOWNLEFT)
+        if (r != ERROR_SUCCESS || !ks) {
+            XINPUT_GAMEPAD vr{};
+            if (r == ERROR_DEVICE_NOT_CONNECTED && ks && !reserved &&
+                (user == 0 || user == XUSER_INDEX_ANY) && MotionState(vr)) return ERROR_EMPTY;
             return r;
+        }
+        if (g_consume.load(std::memory_order_relaxed) && ks->VirtualKey >= VK_PAD_RTHUMB_UP &&
+            ks->VirtualKey <= VK_PAD_RTHUMB_DOWNLEFT) continue;
+        if (g_motionAvailable.load(std::memory_order_relaxed) && ks->UserIndex == 0 && (ks->Flags & XINPUT_KEYSTROKE_KEYUP)) {
+            std::lock_guard<std::mutex> lock(g_motionMutex);
+            if (g_motionPad.Held(ks->VirtualKey)) continue;
+        }
+#if defined(PC2VR_MOTION_INPUT_TRACE)
+        motiontrace::Key(false,*ks);
+#endif
+        return r;
     }
+}
+
+// Capabilities are an executable IAT entry, not another OS-specific code patch.
+// Retail imports ordinal 4 from XINPUT1_4.dll (static inventory, 2026-10-14).
+using CapabilitiesFn = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+CapabilitiesFn g_capsOriginal = nullptr;
+DWORD WINAPI HookCapabilities(DWORD user, DWORD flags, XINPUT_CAPABILITIES* out) {
+    const DWORD result = g_capsOriginal(user, flags, out);
+    XINPUT_GAMEPAD vr{};
+    if (user != 0 || !out || (flags != 0 && flags != XINPUT_FLAG_GAMEPAD) ||
+        result != ERROR_DEVICE_NOT_CONNECTED || !MotionState(vr)) return result;
+    *out = {}; out->Type = XINPUT_DEVTYPE_GAMEPAD; out->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+    out->Gamepad.wButtons = 0xF3FF;
+    out->Gamepad.bLeftTrigger = out->Gamepad.bRightTrigger = 255;
+    out->Gamepad.sThumbLX = out->Gamepad.sThumbLY = out->Gamepad.sThumbRX = out->Gamepad.sThumbRY = -1;
+    return ERROR_SUCCESS;
+}
+bool HookCapabilitiesImport() {
+    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+    const auto* imports = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; imports->Name; ++imports) {
+        if (_stricmp(reinterpret_cast<const char*>(base + imports->Name), "XINPUT1_4.dll") || !imports->OriginalFirstThunk) continue;
+        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + imports->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imports->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            const bool match = IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) ? IMAGE_ORDINAL64(names->u1.Ordinal) == 4 :
+                !strcmp(reinterpret_cast<const char*>(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name), "XInputGetCapabilities");
+            if (!match) continue;
+            auto** slot = reinterpret_cast<void**>(&slots->u1.Function);
+            DWORD old{}; if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+            g_capsOriginal = reinterpret_cast<CapabilitiesFn>(*slot);
+            InterlockedExchangePointer(slot, reinterpret_cast<void*>(&HookCapabilities));
+            VirtualProtect(slot, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---- raw HID (the game also reads gamepads with HidP_GetData) ----
@@ -280,7 +378,7 @@ HMODULE SystemModule(const wchar_t* name) {
 
 }  // namespace
 
-bool Install() {
+bool Install(bool motionControllers) {
     bool any = false;
     if (HMODULE x = SystemModule(L"xinput1_4.dll")) {
         void* orig = nullptr;
@@ -307,11 +405,24 @@ bool Install() {
         }
         if (HMODULE user32 = SystemModule(L"user32.dll")) any = HookRawInput(user32, hid) || any;
     }
+    g_motionAvailable.store(motionControllers && g_xinputOriginal && g_keystrokeOriginal && HookCapabilitiesImport());
+    if (motionControllers) LOG("motion: XInput bridge %s", MotionAvailable() ? "ready" : "unavailable; physical input retained");
     return any;
 }
 
-float TurnAxis() { return Strongest(g_userTurn, g_turn); }
-float TiltAxis() { return Strongest(g_userTilt, g_tilt); }
+float MotionAxis(bool tilt) {
+    XINPUT_GAMEPAD vr{}; if (!MotionState(vr)) return 0.f;
+    return Shape((tilt ? vr.sThumbRY : vr.sThumbRX) / 32767.f);
+}
+float TurnAxis() { const float physical = Strongest(g_userTurn, g_turn), vr = MotionAxis(false); return std::fabs(vr) > std::fabs(physical) ? vr : physical; }
+float TiltAxis() { const float physical = Strongest(g_userTilt, g_tilt), vr = MotionAxis(true); return std::fabs(vr) > std::fabs(physical) ? vr : physical; }
+
+bool MotionAvailable() { return g_motionAvailable.load(); }
+void PublishMotion(const motion::Frame& frame) {
+    if (!MotionAvailable()) return;
+    std::lock_guard<std::mutex> lock(g_motionMutex);
+    g_motionPad.Publish(frame, GetTickCount64());
+}
 
 void SetConsumeRightStick(bool on) { g_consume.store(on, std::memory_order_relaxed); }
 

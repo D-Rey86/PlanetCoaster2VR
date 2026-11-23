@@ -19,6 +19,7 @@
 #include "log.h"
 #include "view_cb.h"
 #include "depth_probe.h"
+#include "afw_warp.h"
 #include "ui_layer.h"
 #include "vrs.h"
 #include "xr_runtime.h"
@@ -145,7 +146,8 @@ void BuildSameProjectionRows(const Copies& c, const float (*full)[cbmath::kRows]
 // Rows written: 0-15 (view-projection, current and previous), 79-92 (frustum planes,
 // position, basis, corner rays), 95 and 99 (tan spans, FOV); the rest keep each
 // copy's own values.
-void WriteEyeRows(const Copies& c, const EyeRows& rows) {
+bool WriteEyeRows(const Copies& c, const EyeRows& rows) {
+    bool wrote = true;
     for (int i = 0; i < c.n; ++i) {
         const float (*r)[4] = reinterpret_cast<const float (*)[4]>(rows.data() + static_cast<size_t>(i) * cbmath::kRows * 4);
         // Only the rows written are checked: other rows of the buffer can legitimately
@@ -161,14 +163,16 @@ void WriteEyeRows(const Copies& c, const EyeRows& rows) {
         if (!finite) {
             static int skipped = 0;
             if (++skipped <= 5) LOG("stereo: non-finite eye rows for copy %d; copy left as the game wrote it", i);
+            wrote = false;
             continue;  // never hand the GPU a NaN camera (it hung once)
         }
-        SafeCopy(c.cbs[i], r[0], 16 * 16);
-        SafeCopy(c.cbs[i] + 79 * 16, r[79], 14 * 16);
-        SafeCopy(c.cbs[i] + 95 * 16, r[95], 16);
-        SafeCopy(c.cbs[i] + 98 * 16, r[98], 8);  // previous jitter
-        SafeCopy(c.cbs[i] + 99 * 16, r[99], 16);
+        wrote &= SafeCopy(c.cbs[i], r[0], 16 * 16);
+        wrote &= SafeCopy(c.cbs[i] + 79 * 16, r[79], 14 * 16);
+        wrote &= SafeCopy(c.cbs[i] + 95 * 16, r[95], 16);
+        wrote &= SafeCopy(c.cbs[i] + 98 * 16, r[98], 8);  // previous jitter
+        wrote &= SafeCopy(c.cbs[i] + 99 * 16, r[99], 16);
     }
+    return wrote;
 }
 
 // ---- both eyes queued; a helper thread moves the camera between them ----
@@ -230,32 +234,33 @@ bool InitHelper(ID3D12CommandQueue* queue) {
 }
 
 // Execute the existing world-marker/HUD split without profiling submissions.
-void ExecuteEyeBatch(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists,
-                     ExecuteFn execute, int eye, int split) {
+ID3D12Resource* ExecuteEyeBatch(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists,
+                               ExecuteFn execute, int eye, int split, bool first, bool keepMarkers) {
     const int markers = split > 0 ? ui::MarkerSplit() : -1;
     const bool withMarkers = markers > 0 && markers < split;
     if (split <= 0) {
         execute(queue, count, lists);
-        return;
+        return nullptr;
     }
     uint32_t done = 0;
     if (withMarkers) {
         execute(queue, static_cast<uint32_t>(markers), lists);
-        ui::SaveMarkers(queue, eye, execute);
+        ui::SaveMarkers(queue, eye, execute, first);
         done = static_cast<uint32_t>(markers);
     }
     execute(queue, static_cast<uint32_t>(split) - done, lists + done);
-    ui::Separate(queue, eye, execute);
+    auto* saved = ui::Separate(queue, eye, execute, first, keepMarkers);
     execute(queue, count - static_cast<uint32_t>(split), lists + split);
+    return saved;
 }
 
 // Runs the batch for the first eye (camera already moved), then queues the second
-// run behind the helper's camera move. afterEach(eye) records work right after each
+// run behind the helper's camera move. afterEach records work right after each
 // run (the eye capture).
 template <typename AfterEach>
 void RunTwice(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists, ExecuteFn execute,
-              const Copies& c, const float* secondOffset, AfterEach afterEach, EyeRows* secondRows = nullptr,
-              void (*beforeEach)(ID3D12CommandQueue*, int) = nullptr, int uiSplit = -1) {
+              const Copies& c, const float* secondOffset, AfterEach afterEach, EyeRows* secondRows,
+              void (*beforeEach)(ID3D12CommandQueue*, int), int uiSplit, bool keepMarkers) {
     Job j;
     j.copies = c;
     memcpy(j.offset, secondOffset, sizeof(j.offset));
@@ -263,8 +268,7 @@ void RunTwice(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* cons
     j.doneValue = ++g_doneValue;
     j.goValue = ++g_goValue;
     if (beforeEach) beforeEach(queue, 0);
-    ExecuteEyeBatch(queue, count, lists, execute, 0, uiSplit);
-    afterEach(0);
+    afterEach(0, ExecuteEyeBatch(queue, count, lists, execute, 0, uiSplit, true, keepMarkers));
     queue->Signal(g_done.Get(), j.doneValue);
     queue->Wait(g_go.Get(), j.goValue);
     {
@@ -273,8 +277,7 @@ void RunTwice(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* cons
     }
     g_jobCv.notify_one();
     if (beforeEach) beforeEach(queue, 1);
-    ExecuteEyeBatch(queue, count, lists, execute, 1, uiSplit);
-    afterEach(1);
+    afterEach(1, ExecuteEyeBatch(queue, count, lists, execute, 1, uiSplit, false, keepMarkers));
 }
 
 }  // namespace
@@ -282,7 +285,7 @@ void RunTwice(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* cons
 bool Active() { return xr::StereoEnabled(); }
 
 bool OnExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* const* lists, ExecuteFn execute) {
-    if (count < 8 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    if (count < 8 || xr::HoldingCameraHandoff() || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
     Copies c;
     const float (*cached[kMaxCopies])[4] = {};
     c.n = patcher::MainViewCopies(count, lists, c.cbs, cached, kMaxCopies);
@@ -300,7 +303,7 @@ bool OnExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* con
     // True stereo: each eye's offset from the head, on the engine camera's axes.
     float local[2][3], scale = 1.f, tanFov[2][4];
     bool perEye = false;
-    if (!xr::StereoEyesForFrame(local, scale, tanFov, perEye) || !InitHelper(queue)) {
+    if (!xr::StereoEyesForFrame(local, scale, tanFov, perEye)) {
         static uint64_t noPose = 0;
         if (++noPose % 300 == 1) LOG("stereo: no head pose for this batch (%llu so far); mono", noPose);
         return false;
@@ -321,32 +324,17 @@ bool OnExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* con
     // The game's UI goes on its own panel: taken out of the image before the list that
     // composites the frame (ui_layer). -1: it stays in the image.
     const int uiSplit = ui::PlanBatch(count, lists, image, compositeList);
-    bool captured = true;
-    if (perEye) {
-        static float full[kMaxCopies][cbmath::kRows][4];
-        for (int i = 0; i < c.n; ++i) {
-            if (cached[i])
-                memcpy(full[i], cached[i], sizeof(full[i]));
-            else if (!SafeCopy(full[i], c.cbs[i], sizeof(full[i])))
-                return false;
-        }
-        // Only this submit thread writes the first eye. Retain its allocation; the
-        // second eye transfers its own storage to the fence-waiting helper job.
-        static thread_local EyeRows first;
-        EyeRows second;
-        BuildEyeRows(c, full, off[0], tanFov[0], 0, first);
-        BuildEyeRows(c, full, off[1], tanFov[1], 1, second);
-        WriteEyeRows(c, first);
-        RunTwice(queue, count, lists, execute, c, off[1],
-                 [&](int eye) { captured = captured && xr::CaptureEye(eye, queue, image); }, &second, nullptr, uiSplit);
-    } else {
-        static float full[kMaxCopies][cbmath::kRows][4];
-        for (int i = 0; i < c.n; ++i) {
-            if (cached[i])
-                memcpy(full[i], cached[i], sizeof(full[i]));
-            else if (!SafeCopy(full[i], c.cbs[i], sizeof(full[i])))
-                return false;
-        }
+    const int alternate = xr::AlternateEyeForFrame();
+    const bool keepMarkers = xr::FrameWarpEnabled() && xr::AlternateScene() && ui::Settings().markers3d;
+    if (alternate < 0 && !InitHelper(queue)) return false;
+    static float full[kMaxCopies][cbmath::kRows][4];
+    for (int i = 0; i < c.n; ++i) {
+        if (cached[i])
+            memcpy(full[i], cached[i], sizeof(full[i]));
+        else if (!SafeCopy(full[i], c.cbs[i], sizeof(full[i])))
+            return false;
+    }
+    if (!perEye) {
         // Foveated rendering: the scene size (smallest view copy), the engine frustum and
         // each eye's centre of view, for the shading-rate image filled before each run.
         {
@@ -365,16 +353,70 @@ bool OnExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* con
             g_fov.frustum[3] = pv.fov.tanDown;
             g_fov.valid = xr::EyeCentersTan(g_fov.center, g_fov.fullRate);
         }
-        static thread_local EyeRows first;
+    }
+    const auto beforeEye = !perEye && vrs::Enabled() && g_fov.valid ? &PrepareFoveation : nullptr;
+    // The submit thread keeps its allocation. Only the true stereo path builds
+    // and transfers a second set of rows to the fence-waiting helper.
+    static thread_local EyeRows first;
+    const auto buildRows = [&](int eye, EyeRows& rows) {
+        if (perEye) BuildEyeRows(c, full, off[eye], tanFov[eye], eye, rows);
+        else BuildSameProjectionRows(c, full, off[eye], eye, rows);
+    };
+    bool captured = false;
+    if (alternate >= 0) {
+        buildRows(alternate, first);
+        if (!perEye) {
+            // Exactly one run wrote history on the previous game frame.
+            memcpy(g_lastSecondOffset, off[alternate], sizeof(g_lastSecondOffset));
+            g_haveLastRun = true;
+        }
+        const bool wrote = WriteEyeRows(c, first);
+        afw::Frame warp{};
+        if (wrote && xr::FrameWarpEnabled() && uiSplit > 0) {
+            // Match the native render-sized view before any display upscaling.
+            int smallest = 0;
+            const auto area = [&](int i) {
+                const auto* size = full[i][viewcb::kRowRenderSize];
+                return size[0]*size[1];
+            };
+            for (int i=1; i<c.n; ++i) if (area(i)<area(smallest)) smallest=i;
+            const auto* size = full[smallest][viewcb::kRowRenderSize];
+            if (size[0]>=1 && size[0]<=16384 && size[1]>=1 && size[1]<=16384) {
+                warp.width=static_cast<UINT>(size[0]);
+                warp.height=static_cast<UINT>(size[1]);
+                warp.guides=afw::FindGuides(count,lists,warp.width,warp.height);
+                if (warp.guides.depth) {
+                    cbmath::Rows actual;
+                    memcpy(actual,first.data()+static_cast<size_t>(smallest)*cbmath::kRows*4,sizeof(actual));
+                    warp.source=cbmath::Parse(actual);
+                    warp.target=warp.source;
+                    const int other=alternate^1;
+                    const float* from=off[alternate];
+                    const float* to=off[other];
+                    warp.target.pos={warp.source.pos.x+to[0]-from[0],warp.source.pos.y+to[1]-from[1],warp.source.pos.z+to[2]-from[2]};
+                    if (perEye) warp.target.fov={tanFov[other][0],tanFov[other][1],tanFov[other][2],tanFov[other][3]};
+                }
+            }
+        }
+        if (beforeEye) beforeEye(queue, alternate);
+        auto* markers = ExecuteEyeBatch(queue, count, lists, execute, alternate, uiSplit, true, keepMarkers);
+        const auto* usableWarp = warp.guides.depth && (!keepMarkers || markers) ? &warp : nullptr;
+        if (xr::CaptureEye(alternate, queue, image, true, usableWarp, markers))
+            xr::AlternateEyeCaptured(alternate);
+    } else {
         EyeRows second;
-        BuildSameProjectionRows(c, full, off[0], 0, first);
-        BuildSameProjectionRows(c, full, off[1], 1, second);
-        memcpy(g_lastSecondOffset, off[1], sizeof(g_lastSecondOffset));
-        g_haveLastRun = true;
+        buildRows(0, first);
+        buildRows(1, second);
+        if (!perEye) {
+            memcpy(g_lastSecondOffset, off[1], sizeof(g_lastSecondOffset));
+            g_haveLastRun = true;
+        }
         WriteEyeRows(c, first);
+        captured = true;
         RunTwice(queue, count, lists, execute, c, off[1],
-                 [&](int eye) { captured = captured && xr::CaptureEye(eye, queue, image); }, &second,
-                 vrs::Enabled() && g_fov.valid ? &PrepareFoveation : nullptr, uiSplit);
+                 [&](int eye, ID3D12Resource* markers) {
+                     captured = captured && xr::CaptureEye(eye, queue, image, eye == 0, nullptr, markers);
+                 }, &second, beforeEye, uiSplit, keepMarkers);
     }
     ui::FinishBatch(count, lists);
     {

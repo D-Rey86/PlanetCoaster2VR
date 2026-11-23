@@ -19,6 +19,7 @@
 #include "upload_registry.h"
 #include "view_cb.h"
 #include "xr_runtime.h"
+#include "afw_inputs.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -36,6 +37,7 @@ constexpr size_t kSlotExecuteCommandLists = 10;
 constexpr size_t kSlotCreateCommittedResource = 27;
 constexpr size_t kSlotCreatePlacedResource = 29;
 constexpr size_t kSlotCreateRenderTargetView = 20;
+constexpr size_t kSlotCreateDepthStencilView = 21;
 constexpr size_t kSlotCreateGraphicsPipelineState = 10;
 constexpr size_t kSlotCreatePipelineState = 47; // ID3D12Device2
 constexpr size_t kSlotCreateCommittedResource1 = 53;  // ID3D12Device4
@@ -45,6 +47,7 @@ constexpr size_t kSlotCreateCommittedResource3 = 76;  // ID3D12Device10
 constexpr size_t kSlotCreatePlacedResource2 = 77;     // ID3D12Device10
 // ID3D12GraphicsCommandList
 constexpr size_t kSlotListReset = 10;
+constexpr size_t kSlotDrawInstanced = 12;
 constexpr size_t kSlotCopyTextureRegion = 16;
 constexpr size_t kSlotCopyResource = 17;
 constexpr size_t kSlotResourceBarrier = 26;
@@ -63,6 +66,7 @@ Patch g_present, g_present1, g_resize, g_execute;
 Patch g_ccr, g_cpr, g_ccr1, g_ccr2, g_cpr1, g_ccr3, g_cpr2, g_crtv, g_omrt;
 Patch g_setComputeCbv, g_setGraphicsCbv, g_listReset, g_copyTex, g_copyRes, g_barrier;
 Patch g_graphicsPipeline, g_pipelineStream, g_setPipeline, g_indirect;
+Patch g_dsv, g_draw;
 
 void** g_cmdListVtable = nullptr;
 
@@ -122,6 +126,17 @@ void STDMETHODCALLTYPE HookCreateRenderTargetView(ID3D12Device* self, ID3D12Reso
     rtvreg::Record(res, desc, handle);
 }
 
+void STDMETHODCALLTYPE HookCreateDepthStencilView(ID3D12Device* self, ID3D12Resource* res,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    Orig<decltype(&HookCreateDepthStencilView)>(g_dsv)(self, res, desc, handle);
+    rtvreg::Record(res, nullptr, handle);
+}
+
+void STDMETHODCALLTYPE HookDrawInstanced(ID3D12GraphicsCommandList* self, UINT vertices, UINT instances, UINT start, UINT instance) {
+    afw::OnDraw(self, vertices, instances);
+    Orig<decltype(&HookDrawInstanced)>(g_draw)(self, vertices, instances, start, instance);
+}
+
 void STDMETHODCALLTYPE HookOMSetRenderTargets(ID3D12GraphicsCommandList* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
                                               BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     Orig<decltype(&HookOMSetRenderTargets)>(g_omrt)(self, count, rtvs, singleRange, dsv);
@@ -130,6 +145,7 @@ void STDMETHODCALLTYPE HookOMSetRenderTargets(ID3D12GraphicsCommandList* self, U
     highlight::OnTargetsBound(self, count, dsv != nullptr, count && rtvs ? rtvs[0] : D3D12_CPU_DESCRIPTOR_HANDLE{}, known ? &rt0 : nullptr);
     vrs::OnSetRenderTargets(self, known ? &rt0 : nullptr, dsv != nullptr);
     ui::OnSetRenderTargets(self, known ? &rt0 : nullptr);
+    afw::OnTargets(self, known && count == 1 ? &rt0 : nullptr, dsv);
 }
 
 D3D12_HEAP_TYPE HeapType(ID3D12Heap* heap) { return heap ? heap->GetDesc().Properties.Type : D3D12_HEAP_TYPE_DEFAULT; }
@@ -157,6 +173,7 @@ HRESULT STDMETHODCALLTYPE HookCreatePipelineState(ID3D12Device2* self, const D3D
 void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
     Orig<decltype(&HookSetPipelineState)>(g_setPipeline)(self, pipeline);
     highlight::OnPipelineBound(self, pipeline);
+    afw::OnPipeline(self, pipeline);
 }
 void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature,
     UINT maxCount, ID3D12Resource* arguments, UINT64 argumentOffset, ID3D12Resource* count, UINT64 countOffset) {
@@ -245,6 +262,7 @@ HRESULT STDMETHODCALLTYPE HookListReset(ID3D12GraphicsCommandList* self, ID3D12C
     patcher::OnCommandListReset(self);
     xr::OnListReset(self);
     depth::OnListReset(self);
+    afw::OnReset(self, pso);
     vrs::OnListReset(self);
     ui::OnListReset(self);
     return Orig<decltype(&HookListReset)>(g_listReset)(self, alloc, pso);
@@ -269,6 +287,7 @@ void STDMETHODCALLTYPE HookResourceBarrier(ID3D12GraphicsCommandList* self, UINT
                                            const D3D12_RESOURCE_BARRIER* barriers) {
     xr::OnGameBarrier(self, count, barriers);
     depth::OnBarrier(self, count, barriers);
+    afw::OnBarriers(self, count, barriers);
     ui::OnBarrier(self, count, barriers);
     Orig<decltype(&HookResourceBarrier)>(g_barrier)(self, count, barriers);
 }
@@ -379,6 +398,7 @@ bool InstallEarly() {
     bool ok = PatchSlot(dv, kSlotCreateCommittedResource, reinterpret_cast<void*>(&HookCreateCommittedResource), g_ccr) &&
               PatchSlot(dv, kSlotCreatePlacedResource, reinterpret_cast<void*>(&HookCreatePlacedResource), g_cpr) &&
               PatchSlot(dv, kSlotCreateRenderTargetView, reinterpret_cast<void*>(&HookCreateRenderTargetView), g_crtv);
+    if (ok) PatchSlot(dv, kSlotCreateDepthStencilView, reinterpret_cast<void*>(&HookCreateDepthStencilView), g_dsv);
     if (ok) ok = PatchSlot(dv, kSlotCreateGraphicsPipelineState, reinterpret_cast<void*>(&HookCreateGraphicsPipelineState), g_graphicsPipeline);
     ComPtr<ID3D12Device2> d2;
     if (ok && SUCCEEDED(device.As(&d2)))
@@ -449,6 +469,7 @@ bool InstallEarly() {
         RestoreSlot(g_pipelineStream);
         RestoreSlot(g_graphicsPipeline);
         RestoreSlot(g_crtv);
+        RestoreSlot(g_dsv);
         RestoreSlot(g_cpr2);
         RestoreSlot(g_ccr3);
         RestoreSlot(g_cpr1);
@@ -532,6 +553,8 @@ bool InstallLate(bool enableXr) {
             if (ok && g_cmdListVtable)
                 ok = PatchSlot(g_cmdListVtable, kSlotSetPipelineState, reinterpret_cast<void*>(&HookSetPipelineState), g_setPipeline) &&
                      PatchSlot(g_cmdListVtable, kSlotExecuteIndirect, reinterpret_cast<void*>(&HookExecuteIndirect), g_indirect);
+            if (ok && g_cmdListVtable)
+                PatchSlot(g_cmdListVtable, kSlotDrawInstanced, reinterpret_cast<void*>(&HookDrawInstanced), g_draw);
             LOG("InstallLate: swapchain vtable %p, queue vtable %p, cmdlist vtable %p, patched=%d", sv, qv,
                 g_cmdListVtable, ok ? 1 : 0);
         }
@@ -542,7 +565,7 @@ bool InstallLate(bool enableXr) {
 }
 
 void Uninstall() {
-    for (Patch* p : {&g_indirect, &g_setPipeline, &g_pipelineStream, &g_graphicsPipeline, &g_omrt, &g_crtv, &g_barrier, &g_copyRes, &g_copyTex, &g_listReset, &g_setGraphicsCbv, &g_setComputeCbv, &g_execute, &g_resize, &g_present1, &g_present, &g_cpr2,
+    for (Patch* p : {&g_draw, &g_dsv, &g_indirect, &g_setPipeline, &g_pipelineStream, &g_graphicsPipeline, &g_omrt, &g_crtv, &g_barrier, &g_copyRes, &g_copyTex, &g_listReset, &g_setGraphicsCbv, &g_setComputeCbv, &g_execute, &g_resize, &g_present1, &g_present, &g_cpr2,
                      &g_ccr3, &g_cpr1, &g_ccr2, &g_ccr1, &g_cpr, &g_ccr})
         RestoreSlot(*p);
 }

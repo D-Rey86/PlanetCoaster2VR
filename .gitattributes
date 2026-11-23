@@ -3,3 +3,5 @@
 Tools/CheekyDLSS/*.patch text eol=lf -whitespace
 Tools/CheekyDLSS/LICENSE.upstream.txt text eol=lf -whitespace
 LICENSE text eol=lf -whitespace
+# The embedded menu is a byte-for-byte resource, including its line endings.
+Loader/ui/VRMenu.js -text whitespace=cr-at-eol
