@@ -75,6 +75,21 @@ text editor or in the VR tab. To roll back, close the game and restore your
 backed-up DLLs and settings together. Manual installation requires no installer
 or terminal command.
 
+When upgrading an Alpha 2 configuration, enable the new motion-controller features
+by opening `PC2VR/pc2vr.ini` in a text editor and adding these keys. Add keys to
+an existing section when present; create the section only when missing. Keep
+your other settings:
+
+```ini
+[Controls]
+MotionControllers=1
+[Experiments]
+WorldLaser=1
+```
+
+Fresh beta settings already include them. The VR tab's left-hand panels, build
+wheel and dashboard toggles control the wrist UI; their fresh defaults are On.
+
 The mod uses a separate `Graphics.vr.config.xml` derived from your original game
 graphics profile and keeps VR windowed. Choose AA/DLSS and other graphics settings
 in the game. Installing the package does not change NVIDIA driver profiles or
